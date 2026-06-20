@@ -23,6 +23,7 @@ LABEL_IR_FIELD="${LABEL_IR_FIELD:-o3_ir}"
 INTRINSIC_INCLUDE_PREFIXES="${INTRINSIC_INCLUDE_PREFIXES:-}"
 INTRINSIC_EXCLUDE_PREFIXES="${INTRINSIC_EXCLUDE_PREFIXES:-}"
 INSTRUCTION_SPEC_JSONL="${INSTRUCTION_SPEC_JSONL:-}"
+INSTRUCTION_SPLIT_POLICY="${INSTRUCTION_SPLIT_POLICY:-config/instruction_semantic_splits.json}"
 
 MAX_TOKEN_VOCAB="${MAX_TOKEN_VOCAB:-20000}"
 MAX_INSTRUCTION_VOCAB="${MAX_INSTRUCTION_VOCAB:-512}"
@@ -39,17 +40,12 @@ LR="${LR:-0.001}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0001}"
 EVAL_KS="${EVAL_KS:-10,20,50}"
 DEVICE="${DEVICE:-auto}"
-TRAINER="${TRAINER:-classifier}"                 # classifier or dual
 
 SPLIT_DIR="runs/iroptset/splits/${OUT_TAG}"
 LABEL_DIR="runs/iroptset/instruction_labels/${OUT_TAG}"
 GRAPH_DIR="runs/iroptset/graphs/${OUT_TAG}"
 INSTRUCTION_GRAPH_DIR="runs/iroptset/instruction_graphs/${OUT_TAG}"
-if [[ "$TRAINER" == "dual" ]]; then
-  MODEL_DIR="runs/iroptset/models/dual_gnn_${OUT_TAG}"
-else
-  MODEL_DIR="runs/iroptset/models/gnn_${OUT_TAG}"
-fi
+MODEL_DIR="runs/iroptset/models/dual_gnn_${OUT_TAG}"
 
 if [[ -n "$PYTHONPATH_PREFIX" ]]; then
   export PYTHONPATH="$PYTHONPATH_PREFIX${PYTHONPATH:+:$PYTHONPATH}"
@@ -86,6 +82,11 @@ echo "==> Creating splits in ${SPLIT_DIR}"
 "${split_args[@]}"
 
 echo "==> Generating instruction labels in ${LABEL_DIR}"
+if [[ -z "$INSTRUCTION_SPEC_JSONL" ]]; then
+  echo "INSTRUCTION_SPEC_JSONL is required for the dual-graph instruction retriever" >&2
+  exit 2
+fi
+
 label_args=(
   python3 scripts/label_iroptset_instructions.py
   --split-dir "$SPLIT_DIR"
@@ -102,12 +103,11 @@ fi
 
 "${label_args[@]}"
 
-if [[ -n "$INSTRUCTION_SPEC_JSONL" ]]; then
-  echo "==> Building instruction semantic graphs in ${INSTRUCTION_GRAPH_DIR}"
-  python3 scripts/build_instruction_semantic_graphs.py \
-    --spec-jsonl "$INSTRUCTION_SPEC_JSONL" \
-    --out-dir "$INSTRUCTION_GRAPH_DIR"
-fi
+echo "==> Building instruction semantic graphs in ${INSTRUCTION_GRAPH_DIR}"
+python3 scripts/build_instruction_semantic_graphs.py \
+  --spec-jsonl "$INSTRUCTION_SPEC_JSONL" \
+  --split-policy "$INSTRUCTION_SPLIT_POLICY" \
+  --out-dir "$INSTRUCTION_GRAPH_DIR"
 
 echo "==> Building graph dataset in ${GRAPH_DIR}"
 python3 scripts/build_iroptset_graph_dataset.py \
@@ -121,45 +121,24 @@ python3 scripts/build_iroptset_graph_dataset.py \
   --max-edges "$MAX_EDGES"
 
 echo "==> Training GNN in ${MODEL_DIR}"
-if [[ "$TRAINER" == "dual" ]]; then
-  if [[ -z "$INSTRUCTION_SPEC_JSONL" ]]; then
-    echo "INSTRUCTION_SPEC_JSONL is required when TRAINER=dual" >&2
-    exit 2
-  fi
-  python3 scripts/train_instruction_dual_gnn.py \
-    --program-graph-dir "$GRAPH_DIR" \
-    --instruction-graph-dir "$INSTRUCTION_GRAPH_DIR" \
-    --out-dir "$MODEL_DIR" \
-    --epochs "$EPOCHS" \
-    --batch-size "$BATCH_SIZE" \
-    --instruction-batch-size "$INSTRUCTION_BATCH_SIZE" \
-    --hidden-dim "$HIDDEN_DIM" \
-    --layers "$LAYERS" \
-    --dropout "$DROPOUT" \
-    --lr "$LR" \
-    --weight-decay "$WEIGHT_DECAY" \
-    --device "$DEVICE" \
-    --eval-ks "$EVAL_KS"
-else
-  python3 scripts/train_instruction_gnn.py \
-    --graph-dir "$GRAPH_DIR" \
-    --out-dir "$MODEL_DIR" \
-    --epochs "$EPOCHS" \
-    --batch-size "$BATCH_SIZE" \
-    --hidden-dim "$HIDDEN_DIM" \
-    --layers "$LAYERS" \
-    --dropout "$DROPOUT" \
-    --lr "$LR" \
-    --weight-decay "$WEIGHT_DECAY" \
-    --device "$DEVICE" \
-    --eval-ks "$EVAL_KS"
-fi
+python3 scripts/train_instruction_dual_gnn.py \
+  --program-graph-dir "$GRAPH_DIR" \
+  --instruction-graph-dir "$INSTRUCTION_GRAPH_DIR" \
+  --out-dir "$MODEL_DIR" \
+  --epochs "$EPOCHS" \
+  --batch-size "$BATCH_SIZE" \
+  --instruction-batch-size "$INSTRUCTION_BATCH_SIZE" \
+  --hidden-dim "$HIDDEN_DIM" \
+  --layers "$LAYERS" \
+  --dropout "$DROPOUT" \
+  --lr "$LR" \
+  --weight-decay "$WEIGHT_DECAY" \
+  --device "$DEVICE" \
+  --eval-ks "$EVAL_KS"
 
 echo "==> Done"
 echo "Splits:  ${SPLIT_DIR}"
 echo "Labels:  ${LABEL_DIR}"
 echo "Graphs:  ${GRAPH_DIR}"
-if [[ -n "$INSTRUCTION_SPEC_JSONL" ]]; then
-  echo "Instr:   ${INSTRUCTION_GRAPH_DIR}"
-fi
+echo "Instr:   ${INSTRUCTION_GRAPH_DIR}"
 echo "Model:   ${MODEL_DIR}"

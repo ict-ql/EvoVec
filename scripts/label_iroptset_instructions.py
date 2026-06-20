@@ -6,7 +6,6 @@ from collections import Counter
 import json
 from pathlib import Path
 import re
-import sys
 from typing import Any
 
 
@@ -111,41 +110,6 @@ def extract_intrinsic_counts(
     return counts
 
 
-def resolve_ir_field(args: argparse.Namespace) -> str:
-    if args.ir_field and args.compile_ir_field and args.ir_field != args.compile_ir_field:
-        raise SystemExit("--ir-field and --compile-ir-field disagree; pass only one IR field")
-    return args.ir_field or args.compile_ir_field or "o3_ir"
-
-
-def warn_deprecated_backend_args(args: argparse.Namespace) -> None:
-    if args.backend != "intrinsic":
-        print(
-            f"warning: --backend={args.backend!r} is deprecated and ignored; "
-            "labels are extracted directly from LLVM IR intrinsics",
-            file=sys.stderr,
-        )
-    deprecated_values = {
-        "--llc": args.llc,
-        "--target": args.target,
-        "--mcpu": args.mcpu,
-        "--mattr": args.mattr,
-        "--opt-level": args.opt_level,
-        "--timeout": args.timeout,
-    }
-    used = [
-        name
-        for name, value in deprecated_values.items()
-        if value not in {None, "", "llc", "x86_64-pc-linux-gnu", "native", "-O3", 60}
-    ]
-    if args.keep_artifacts:
-        used.append("--keep-artifacts")
-    if used:
-        print(
-            "warning: backend compilation options are deprecated and ignored: " + ", ".join(used),
-            file=sys.stderr,
-        )
-
-
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Extract LLVM intrinsic instruction labels from IR-OptSet split records."
@@ -153,8 +117,7 @@ def main() -> int:
     parser.add_argument("--split-dir", type=Path)
     parser.add_argument("--split-jsonl", type=Path, nargs="*")
     parser.add_argument("--out-dir", type=Path, default=Path("runs/iroptset/instruction_labels/pilot_10k_v1"))
-    parser.add_argument("--ir-field", help="IR field to scan for LLVM intrinsic calls; defaults to o3_ir.")
-    parser.add_argument("--compile-ir-field", help="Deprecated alias for --ir-field.")
+    parser.add_argument("--ir-field", default="o3_ir", help="IR field to scan for LLVM intrinsic calls.")
     parser.add_argument(
         "--include-prefix",
         action="append",
@@ -171,26 +134,8 @@ def main() -> int:
         help="Keep debug/lifetime/control intrinsics instead of applying the default noise filters.",
     )
     parser.add_argument("--limit", type=int, default=0, help="Optional per-split row limit; 0 means all rows.")
-
-    # Backward-compatible no-op options kept so old pipeline commands do not
-    # accidentally force an LLVM backend just to build labels.
-    parser.add_argument(
-        "--backend",
-        choices=["intrinsic", "auto", "llc", "llvmlite"],
-        default="intrinsic",
-        help=argparse.SUPPRESS,
-    )
-    parser.add_argument("--llc", default="llc", help=argparse.SUPPRESS)
-    parser.add_argument("--target", default="x86_64-pc-linux-gnu", help=argparse.SUPPRESS)
-    parser.add_argument("--mcpu", default="native", help=argparse.SUPPRESS)
-    parser.add_argument("--mattr", default="", help=argparse.SUPPRESS)
-    parser.add_argument("--opt-level", default="-O3", help=argparse.SUPPRESS)
-    parser.add_argument("--timeout", type=int, default=60, help=argparse.SUPPRESS)
-    parser.add_argument("--keep-artifacts", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
 
-    warn_deprecated_backend_args(args)
-    ir_field = resolve_ir_field(args)
     include_prefixes = parse_prefixes(args.include_prefix)
     extra_exclude_prefixes = parse_prefixes(args.exclude_prefix)
     default_exclude_prefixes = () if args.no_default_excludes else DEFAULT_EXCLUDE_INTRINSIC_PREFIXES
@@ -211,14 +156,14 @@ def main() -> int:
         instruction_vocab: Counter[str] = Counter()
         with labels_path.open("w", encoding="utf-8") as labels_file:
             for row in rows:
-                ir_text = record_ir(row, ir_field)
+                ir_text = record_ir(row, args.ir_field)
                 if ir_text is None:
                     failed += 1
                     labels_file.write(
                         json.dumps(
                             {
                                 "ok": False,
-                                "error": f"missing IR field {ir_field}",
+                                "error": f"missing IR field {args.ir_field}",
                                 "dataset_index": row.get("dataset_index"),
                                 "split": split,
                             },
@@ -244,7 +189,7 @@ def main() -> int:
                     "structural_hash": row.get("structural_hash"),
                     "label_kind": "llvm_intrinsic",
                     "label_source": "llvm_ir",
-                    "ir_field": ir_field,
+                    "ir_field": args.ir_field,
                     "include_prefixes": list(include_prefixes),
                     "exclude_prefixes": list(exclude_prefixes),
                     "instruction_counts": count_map,
@@ -272,7 +217,7 @@ def main() -> int:
     summary = {
         "label_kind": "llvm_intrinsic",
         "label_source": "llvm_ir",
-        "ir_field": ir_field,
+        "ir_field": args.ir_field,
         "include_prefixes": list(include_prefixes),
         "exclude_prefixes": list(exclude_prefixes),
         "splits": summaries,

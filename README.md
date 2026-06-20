@@ -58,7 +58,22 @@ entry:
 }
 ```
 
-`scripts/build_iroptset_graph_dataset.py` turns it into a symbolic graph like:
+`scripts/build_iroptset_graph_dataset.py` turns it into a symbolic graph. The
+checked-in example is:
+
+```text
+examples/program_graph/scale_sum.graph.json
+```
+
+Regenerate it with:
+
+```bash
+python3 scripts/inspect_program_graph.py \
+  --ir-file examples/program_graph/scale_sum.ll \
+  --out examples/program_graph/scale_sum.graph.json
+```
+
+Readable sketch:
 
 ```text
 nodes
@@ -110,7 +125,16 @@ Build those instruction micro-op graphs with:
 ```bash
 python3 scripts/build_instruction_semantic_graphs.py \
   --spec-jsonl examples/instruction_semantics/instruction_specs.jsonl \
+  --split-policy config/instruction_semantic_splits.json \
   --out-dir runs/instruction_semantics/sample
+```
+
+To convert Intel/Vegen Intrinsics Guide XML into the spec JSONL format:
+
+```bash
+python3 scripts/import_intel_intrinsics_xml.py \
+  --xml /path/to/data-latest.xml \
+  --out runs/instruction_semantics/intel_intrinsics.jsonl
 ```
 
 For the dual-graph retriever, train with a program graph directory and an
@@ -123,8 +147,9 @@ python3 scripts/train_instruction_dual_gnn.py \
   --out-dir runs/iroptset/models/dual_gnn_pilot_10k_v1
 ```
 
-Or set `TRAINER=dual` and `INSTRUCTION_SPEC_JSONL=...` when using
-`scripts/run_iroptset_gnn_pipeline.sh`.
+When using `scripts/run_iroptset_gnn_pipeline.sh`, set
+`INSTRUCTION_SPEC_JSONL=...`. The pipeline always trains the dual-graph
+retriever.
 
 
 ## GPT-5.5 Pass@1

@@ -8,10 +8,17 @@ from pathlib import Path
 import random
 from typing import Any
 
-try:
-    from train_instruction_gnn import require_torch
-except ModuleNotFoundError:  # pragma: no cover - used when imported as a package module
-    from scripts.train_instruction_gnn import require_torch
+def require_torch():
+    try:
+        import torch
+        import torch.nn as nn
+        import torch.nn.functional as F
+    except ImportError as exc:
+        raise SystemExit(
+            "missing PyTorch; install it on the training server, for example: "
+            "python3 -m pip install torch"
+        ) from exc
+    return torch, nn, F
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -181,7 +188,12 @@ def align_program_rows(
     id_to_instruction = {
         int(label_id): instruction for instruction, label_id in program_vocab["instruction_to_id"].items()
     }
-    instruction_by_label = {str(row["label"]): row for row in instruction_rows}
+    instruction_by_label: dict[str, dict[str, Any]] = {}
+    for row in instruction_rows:
+        keys = [str(row["label"])]
+        keys.extend(str(item) for item in row.get("aliases", []) if str(item))
+        for key in keys:
+            instruction_by_label.setdefault(key, row)
     candidate_labels = [
         label
         for _label_id, label in sorted(id_to_instruction.items())
@@ -333,6 +345,7 @@ def main() -> int:
     parser.add_argument("--temperature", type=float, default=0.07)
     parser.add_argument("--max-pos-weight", type=float, default=20.0)
     parser.add_argument("--eval-ks", default="10,20,50")
+    parser.add_argument("--selection-split", default="train")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=17)
     args = parser.parse_args()
@@ -354,18 +367,25 @@ def main() -> int:
     train_raw = load_jsonl(graph_path(args.program_graph_dir, "train"))
     if not train_raw:
         raise SystemExit("empty train graph split")
-    train_rows, candidate_labels, instruction_rows = align_program_rows(
-        train_raw, program_vocab, instruction_rows_all
+    train_instruction_rows = [row for row in instruction_rows_all if str(row.get("split", "train")) == "train"]
+    if not train_instruction_rows:
+        raise SystemExit("instruction graph directory has no split=train rows")
+    train_rows, train_candidate_labels, train_instruction_rows = align_program_rows(
+        train_raw, program_vocab, train_instruction_rows
     )
     if not train_rows:
         raise SystemExit("no train rows remain after aligning labels with instruction graphs")
 
-    split_rows: dict[str, list[dict[str, Any]]] = {"train": train_rows}
+    eval_rows: dict[str, list[dict[str, Any]]] = {}
+    eval_instruction_rows: dict[str, list[dict[str, Any]]] = {}
+    eval_rows["train"] = train_rows
+    eval_instruction_rows["train"] = train_instruction_rows
     for split in ("val", "test"):
         path = graph_path(args.program_graph_dir, split)
         if path.exists():
             rows, _labels, _candidates = align_program_rows(load_jsonl(path), program_vocab, instruction_rows_all)
-            split_rows[split] = rows
+            eval_rows[split] = rows
+            eval_instruction_rows[split] = instruction_rows_all
 
     program_encoder = RelationalGraphEncoder(
         torch,
@@ -395,7 +415,7 @@ def main() -> int:
         weight_decay=args.weight_decay,
     )
     criterion = nn.BCEWithLogitsLoss(
-        pos_weight=positive_weight(torch, train_rows, len(instruction_rows), args.max_pos_weight, device)
+        pos_weight=positive_weight(torch, train_rows, len(train_instruction_rows), args.max_pos_weight, device)
     )
     ks = [int(item) for item in args.eval_ks.split(",") if item.strip()]
 
@@ -415,11 +435,18 @@ def main() -> int:
         "temperature": args.temperature,
         "max_pos_weight": args.max_pos_weight,
         "eval_ks": ks,
+        "selection_split": args.selection_split,
         "seed": args.seed,
-        "num_candidate_labels": len(candidate_labels),
+        "num_train_candidate_labels": len(train_candidate_labels),
+        "num_eval_candidate_labels": len(instruction_rows_all),
     }
     (args.out_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
-    (args.out_dir / "candidate_labels.json").write_text(json.dumps(candidate_labels, indent=2), encoding="utf-8")
+    (args.out_dir / "train_candidate_labels.json").write_text(
+        json.dumps(train_candidate_labels, indent=2), encoding="utf-8"
+    )
+    (args.out_dir / "eval_candidate_labels.json").write_text(
+        json.dumps([str(row["label"]) for row in instruction_rows_all], indent=2), encoding="utf-8"
+    )
 
     best_score = -math.inf
     history: list[dict[str, Any]] = []
@@ -433,7 +460,7 @@ def main() -> int:
             optimizer,
             criterion,
             train_rows,
-            instruction_rows,
+            train_instruction_rows,
             args.batch_size,
             args.instruction_batch_size,
             args.temperature,
@@ -446,16 +473,16 @@ def main() -> int:
                 program_encoder,
                 instruction_encoder,
                 rows,
-                instruction_rows,
+                eval_instruction_rows[split],
                 args.batch_size,
                 args.instruction_batch_size,
                 ks,
                 args.temperature,
                 device,
             )
-            for split, rows in split_rows.items()
+            for split, rows in eval_rows.items()
         }
-        score = metrics.get("val", metrics["train"]).get("recall@20", 0.0)
+        score = metrics.get(args.selection_split, metrics["train"]).get("recall@20", 0.0)
         row = {"epoch": epoch, "train_loss": train_loss, **metrics}
         history.append(row)
         print(json.dumps(row, sort_keys=True))
@@ -468,7 +495,8 @@ def main() -> int:
                     "config": config,
                     "program_vocab": program_vocab,
                     "instruction_vocab": instruction_vocab,
-                    "candidate_labels": candidate_labels,
+                    "train_candidate_labels": train_candidate_labels,
+                    "eval_candidate_labels": [str(row["label"]) for row in instruction_rows_all],
                     "epoch": epoch,
                     "score": best_score,
                 },
@@ -482,14 +510,14 @@ def main() -> int:
             program_encoder,
             instruction_encoder,
             rows,
-            instruction_rows,
+            eval_instruction_rows[split],
             args.batch_size,
             args.instruction_batch_size,
             ks,
             args.temperature,
             device,
         )
-        for split, rows in split_rows.items()
+        for split, rows in eval_rows.items()
     }
     final_metrics["best_score"] = best_score
     final_metrics["best_checkpoint"] = str(best_path)

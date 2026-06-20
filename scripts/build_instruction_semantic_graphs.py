@@ -100,12 +100,73 @@ def instruction_label(record: dict[str, Any]) -> str:
     return label
 
 
+def record_aliases(record: dict[str, Any]) -> list[str]:
+    aliases: list[str] = []
+    for key in ("label", "llvm_intrinsic", "intrinsic", "instruction"):
+        value = record.get(key)
+        if value:
+            aliases.append(str(value))
+    aliases.extend(str(item) for item in as_list(record.get("aliases")) if str(item))
+    return list(dict.fromkeys(aliases))
+
+
 def as_list(value: Any) -> list[Any]:
     if value is None:
         return []
     if isinstance(value, list):
         return value
     return [value]
+
+
+def normalized_extension(record: dict[str, Any]) -> str:
+    return first_text(record, "extension", "instruction_set").upper().replace("-", "_")
+
+
+def normalized_architecture(record: dict[str, Any]) -> str:
+    return first_text(record, "architecture", "isa").lower()
+
+
+def load_split_policy(path: Path | None) -> dict[str, Any]:
+    if path is None:
+        return {}
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+def policy_list(policy: dict[str, Any], key: str) -> set[str]:
+    return {str(item).upper().replace("-", "_") for item in policy.get(key, [])}
+
+
+def policy_pairs(policy: dict[str, Any], key: str) -> set[tuple[str, str]]:
+    pairs: set[tuple[str, str]] = set()
+    for item in policy.get(key, []):
+        text = str(item)
+        if ":" in text:
+            arch, extension = text.split(":", 1)
+            pairs.add((arch.lower(), extension.upper().replace("-", "_")))
+        else:
+            pairs.add(("", text.upper().replace("-", "_")))
+    return pairs
+
+
+def assign_split(record: dict[str, Any], policy: dict[str, Any]) -> str:
+    if not policy:
+        return str(record.get("split", "train"))
+    arch = normalized_architecture(record)
+    extension = normalized_extension(record)
+    pair = (arch, extension)
+    train_pairs = policy_pairs(policy, "train_extensions")
+    test_pairs = policy_pairs(policy, "test_extensions")
+    train_extensions = policy_list(policy, "train_extension_names")
+    test_extensions = policy_list(policy, "test_extension_names")
+    if pair in train_pairs or extension in train_extensions:
+        return "train"
+    if pair in test_pairs or extension in test_extensions:
+        return "test"
+    if arch == "x86" and policy.get("x86_test_all_except_train", False):
+        return "test"
+    if arch == "riscv" and policy.get("riscv_default_split") == "test":
+        return "test"
+    return str(record.get("split", "train"))
 
 
 def operation_lines(record: dict[str, Any]) -> list[str]:
@@ -300,15 +361,17 @@ def make_output_record(
     symbolic: dict[str, Any],
     token_to_id: dict[str, int],
     include_symbols: bool,
+    split: str,
 ) -> dict[str, Any]:
     encoded = encode_graph(symbolic, token_to_id)
     output = {
         "label": instruction_label(record),
-        "split": str(record.get("split", "train")),
+        "split": split,
         "architecture": first_text(record, "architecture", "isa"),
         "extension": first_text(record, "extension", "instruction_set"),
         "intrinsic": first_text(record, "llvm_intrinsic", "intrinsic"),
         "instruction": first_text(record, "instruction", "assembly"),
+        "aliases": record_aliases(record),
         "num_nodes": len(encoded["node_token_ids"]),
         "num_edges": len(encoded["edges"]),
         "node_token_ids": encoded["node_token_ids"],
@@ -328,6 +391,7 @@ def main() -> int:
     )
     parser.add_argument("--spec-jsonl", type=Path, nargs="+", required=True)
     parser.add_argument("--out-dir", type=Path, default=Path("runs/instruction_semantics/sample"))
+    parser.add_argument("--split-policy", type=Path)
     parser.add_argument("--max-token-vocab", type=int, default=20000)
     parser.add_argument("--min-token-count", type=int, default=1)
     parser.add_argument("--drop-symbols", action="store_true", help="Do not store node tokens/types in graph rows.")
@@ -338,6 +402,7 @@ def main() -> int:
         records.extend(load_jsonl(path))
     if not records:
         raise SystemExit("no instruction specs found")
+    split_policy = load_split_policy(args.split_policy)
 
     symbolic_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
     token_counter: Counter[str] = Counter()
@@ -362,9 +427,9 @@ def main() -> int:
     by_split: dict[str, list[dict[str, Any]]] = defaultdict(list)
     summary: dict[str, Any] = {"splits": {}, "vocab": str(args.out_dir / "vocab.json")}
     for record, symbolic in symbolic_rows:
-        split = str(record.get("split", "train"))
+        split = assign_split(record, split_policy)
         by_split[split].append(
-            make_output_record(record, symbolic, token_to_id, include_symbols=not args.drop_symbols)
+            make_output_record(record, symbolic, token_to_id, include_symbols=not args.drop_symbols, split=split)
         )
 
     for split, rows in sorted(by_split.items()):
@@ -379,6 +444,8 @@ def main() -> int:
         print(json.dumps({"split": split, **summary["splits"][split]}, sort_keys=True))
 
     summary["token_vocab_size"] = len(token_to_id)
+    if args.split_policy:
+        summary["split_policy"] = str(args.split_policy)
     summary["node_type_to_id"] = NODE_TYPES
     summary["edge_type_to_id"] = EDGE_TYPES
     (args.out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")

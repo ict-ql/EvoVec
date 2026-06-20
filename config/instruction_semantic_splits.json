@@ -5,27 +5,23 @@
     "x86:SSE2",
     "x86:SSE3",
     "x86:SSSE3",
-    "x86:SSE4.1",
-    "x86:SSE4.2",
+    "x86:SSE4_1",
+    "x86:SSE4_2",
     "x86:AVX",
     "x86:F16C",
     "x86:FMA",
-    "x86:AVX2",
+    "x86:AVX2"
+  ],
+  "x86_test_all_except_train": true,
+  "test_extensions": [
     "riscv:RVV"
   ],
-  "validation_extensions": [
-    "x86:AVX_VNNI",
-    "x86:AVX_VNNI_INT8"
-  ],
-  "test_extensions": [
-    "x86:AVX512_VNNI",
-    "x86:AVX512_BF16",
-    "x86:AVX512_FP16"
-  ],
-  "holdout_policy": "Keep AVX-512/VNNI-style instructions out of the primary x86 SSE/AVX training set so the instruction semantic graph is tested on newer dot-product and mixed-precision operations that compilers often expose unevenly.",
+  "riscv_default_split": "test",
+  "holdout_policy": "Training contains only baseline x86 SSE/AVX-family extensions. Every other x86 extension, including AVX-VNNI, AVX-512, AVX-512 VNNI, BF16, FP16, AMX, ADX, BMI, AES, SHA, and future Intel extensions, is test-only. RVV is also test-only.",
   "notes": [
     "Use normalized Operation pseudocode as micro-op supervision instead of backend assembly mnemonics.",
-    "Keep architecture and extension metadata explicit so cross-ISA RVV examples can be trained without pretending they are x86 labels.",
-    "Prefer one canonical semantic record per instruction/intrinsic lowering, with aliases recorded as metadata."
+    "Do not put RVV in training; it is a cross-ISA generalization test.",
+    "Do not special-case AVX-512 VNNI as the only x86 test target; it is one member of the non-training x86 extension holdout.",
+    "Keep architecture and extension metadata explicit so cross-ISA failures are interpretable."
   ]
 }

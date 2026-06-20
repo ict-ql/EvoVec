@@ -134,6 +134,7 @@ Build semantic instruction graphs with:
 ```bash
 python3 scripts/build_instruction_semantic_graphs.py \
   --spec-jsonl examples/instruction_semantics/instruction_specs.jsonl \
+  --split-policy config/instruction_semantic_splits.json \
   --out-dir runs/iroptset/instruction_graphs/pilot_10k_v1
 ```
 
@@ -143,26 +144,36 @@ deliberately normalized: it should capture the operation's dataflow, lane
 structure, masks, reductions, extension operations, and accumulation behavior
 without depending on backend lowering.
 
-For x86, the raw material should come from the Intel Intrinsics Guide or its
-offline data export. For RVV, use RVV intrinsic/spec tables. Store only the
-normalized JSONL records in this repo so the model sees a stable schema rather
-than page-specific formatting.
+For x86, the raw material should come from the Intel Intrinsics Guide offline
+XML data. The Vegen `data-latest.xml` file follows that shape and can be
+converted directly:
+
+```bash
+python3 scripts/import_intel_intrinsics_xml.py \
+  --xml /path/to/data-latest.xml \
+  --out runs/instruction_semantics/intel_intrinsics.jsonl
+```
+
+For RVV, use RVV intrinsic/spec tables. Store only the normalized JSONL records
+in this repo so the model sees a stable schema rather than page-specific
+formatting.
 
 ## ISA Split Policy
 
 The first experiment should be explicit about the instruction distribution:
 
 - x86 training: SSE, SSE2, SSE3, SSSE3, SSE4.x, AVX, F16C, FMA, AVX2
-- x86 validation: AVX-VNNI and AVX-VNNI-INT8, if enough records are available
-- x86 held-out test: AVX-512 VNNI, BF16, and FP16-style instructions
-- cross-ISA training: RVV records, kept with `architecture=riscv` and
+- x86 test: every x86 extension not listed above, including AVX-VNNI,
+  AVX-512, AVX-512 VNNI, BF16, FP16, AMX, ADX, BMI, AES, SHA, and future
+  extensions
+- cross-ISA test: RVV records, kept with `architecture=riscv` and
   `extension=RVV`
 
-The point of the AVX-512/VNNI holdout is to test whether the model can use the
-micro-op semantics of newer dot-product and mixed-precision instructions rather
-than only memorizing x86 intrinsic names. The point of the RVV records is to
-teach vector lane, mask, and `vl` semantics in a cross-ISA way while keeping ISA
-metadata explicit.
+AVX-512 VNNI is just one important test family, not the only x86 test target.
+The broader holdout tests whether the model can use micro-op semantics for
+newer dot-product, mixed-precision, matrix/tile, crypto, bit-manipulation, and
+other non-training operations rather than memorizing SSE/AVX names. RVV is a
+cross-ISA generalization test for vector lane, mask, and `vl` semantics.
 
 The machine-readable policy lives in:
 
@@ -170,7 +181,7 @@ The machine-readable policy lives in:
 config/instruction_semantic_splits.json
 ```
 
-## First Model Baseline
+## Dual-Graph Model
 
 The semantic path trains a dual-graph contrastive retriever:
 
@@ -180,16 +191,17 @@ instruction encoder(instruction micro-op semantic graph) -> embedding
 score = dot(program_embedding, instruction_embedding)
 ```
 
+Training loss is built only against `split=train` instruction graphs. Test-only
+instruction graphs such as RVV, AVX-512, AMX, and other non-SSE/AVX x86
+extensions are encoded only during evaluation. The default checkpoint selection
+split is `train`, so held-out extension scores are not used for model selection.
+
 ```bash
 python3 scripts/train_instruction_dual_gnn.py \
   --program-graph-dir runs/iroptset/graphs/pilot_10k_v1 \
   --instruction-graph-dir runs/iroptset/instruction_graphs/pilot_10k_v1 \
   --out-dir runs/iroptset/models/dual_gnn_pilot_10k_v1
 ```
-
-The older classifier path is still available for ablations, but it should be
-treated as a label-only baseline because it does not encode instruction
-micro-op graphs.
 
 Evaluate on the IR-OptSet validation/internal-test splits with:
 
