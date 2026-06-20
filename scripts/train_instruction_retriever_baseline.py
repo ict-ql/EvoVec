@@ -159,7 +159,7 @@ def evaluate(model: dict[str, Any], rows: list[dict[str, Any]], ks: list[int]) -
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Train a simple IR-token to instruction-label retrieval baseline."
+        description="Train a simple IR-token to intrinsic instruction-label retrieval baseline."
     )
     parser.add_argument("--split-dir", type=Path, required=True)
     parser.add_argument("--label-dir", type=Path, required=True)

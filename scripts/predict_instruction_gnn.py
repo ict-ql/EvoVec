@@ -117,7 +117,7 @@ def predict_one(torch, model, graph_row: dict[str, Any], vocab: dict[str, Any], 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Use a trained instruction GNN checkpoint to rank x86 instruction mnemonics for LLVM IR."
+        description="Use a trained instruction GNN checkpoint to rank LLVM intrinsic instruction labels for IR."
     )
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--ir-file", type=Path, help="LLVM IR file to score. Use '-' to read stdin.")

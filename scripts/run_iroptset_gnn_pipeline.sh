@@ -19,12 +19,9 @@ VAL_SIZE="${VAL_SIZE:-2000}"
 TEST_SIZE="${TEST_SIZE:-2000}"
 SEED="${SEED:-17}"
 
-LABEL_BACKEND="${LABEL_BACKEND:-llvmlite}"        # llvmlite or llc
-LLC="${LLC:-llc}"
-TARGET="${TARGET:-x86_64-pc-linux-gnu}"
-MCPU="${MCPU:-generic}"
-OPT_LEVEL="${OPT_LEVEL:--O3}"
-LABEL_TIMEOUT="${LABEL_TIMEOUT:-60}"
+LABEL_IR_FIELD="${LABEL_IR_FIELD:-o3_ir}"
+INTRINSIC_INCLUDE_PREFIXES="${INTRINSIC_INCLUDE_PREFIXES:-}"
+INTRINSIC_EXCLUDE_PREFIXES="${INTRINSIC_EXCLUDE_PREFIXES:-}"
 
 MAX_TOKEN_VOCAB="${MAX_TOKEN_VOCAB:-20000}"
 MAX_INSTRUCTION_VOCAB="${MAX_INSTRUCTION_VOCAB:-512}"
@@ -81,16 +78,21 @@ echo "==> Creating splits in ${SPLIT_DIR}"
 "${split_args[@]}"
 
 echo "==> Generating instruction labels in ${LABEL_DIR}"
-python3 scripts/label_iroptset_instructions.py \
-  --split-dir "$SPLIT_DIR" \
-  --out-dir "$LABEL_DIR" \
-  --compile-ir-field o3_ir \
-  --backend "$LABEL_BACKEND" \
-  --llc "$LLC" \
-  --target "$TARGET" \
-  --mcpu "$MCPU" \
-  --opt-level="$OPT_LEVEL" \
-  --timeout "$LABEL_TIMEOUT"
+label_args=(
+  python3 scripts/label_iroptset_instructions.py
+  --split-dir "$SPLIT_DIR"
+  --out-dir "$LABEL_DIR"
+  --ir-field "$LABEL_IR_FIELD"
+)
+
+if [[ -n "$INTRINSIC_INCLUDE_PREFIXES" ]]; then
+  label_args+=(--include-prefix "$INTRINSIC_INCLUDE_PREFIXES")
+fi
+if [[ -n "$INTRINSIC_EXCLUDE_PREFIXES" ]]; then
+  label_args+=(--exclude-prefix "$INTRINSIC_EXCLUDE_PREFIXES")
+fi
+
+"${label_args[@]}"
 
 echo "==> Building graph dataset in ${GRAPH_DIR}"
 python3 scripts/build_iroptset_graph_dataset.py \

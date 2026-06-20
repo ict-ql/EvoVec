@@ -229,7 +229,7 @@ def train_epoch(model, optimizer, criterion, rows: list[dict[str, Any]], batch_s
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Train a pure-PyTorch GNN for instruction retrieval.")
+    parser = argparse.ArgumentParser(description="Train a pure-PyTorch GNN for intrinsic instruction retrieval.")
     parser.add_argument("--graph-dir", type=Path, required=True)
     parser.add_argument("--out-dir", type=Path, default=Path("runs/iroptset/models/gnn_pilot_10k_v1"))
     parser.add_argument("--epochs", type=int, default=20)

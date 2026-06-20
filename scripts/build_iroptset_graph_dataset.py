@@ -302,7 +302,7 @@ def load_joined(split_dir: Path, label_dir: Path, split: str, ir_field: str) -> 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Build graph JSONL records from IR-OptSet splits and instruction labels."
+        description="Build graph JSONL records from IR-OptSet splits and intrinsic instruction labels."
     )
     parser.add_argument("--split-dir", type=Path, required=True)
     parser.add_argument("--label-dir", type=Path, required=True)

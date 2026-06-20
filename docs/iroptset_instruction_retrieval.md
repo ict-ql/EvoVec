@@ -4,8 +4,9 @@ This plan uses IR-OptSet as the training source for an instruction-retrieval
 module while keeping TSVC as the held-out evaluation set.
 
 The goal is not to train the final GNN immediately. The first milestone is to
-build compiler-derived instruction labels and measure whether a simple retriever
-can predict the instructions a compiler would use for an unseen IR function.
+build IR-derived intrinsic instruction labels and measure whether a simple
+retriever can predict the instruction-like intrinsics used by an unseen IR
+function.
 
 ## Data Split
 
@@ -56,57 +57,42 @@ local parquet input.
 
 ## Instruction Labels
 
-After creating the split, compile each selected optimized IR function to
-assembly and extract the emitted instruction mnemonics:
+After creating the split, scan each selected optimized IR function and extract
+LLVM intrinsic calls. These labels are taken from the middle-end IR directly:
+we do not need to lower with `llc` just to discover instruction-like operations
+that already appear as intrinsics.
 
 ```bash
 python3 scripts/label_iroptset_instructions.py \
   --split-dir runs/iroptset/splits/pilot_10k_v1 \
   --out-dir runs/iroptset/instruction_labels/pilot_10k_v1 \
-  --compile-ir-field o3_ir \
-  --llc llc \
-  --target x86_64-pc-linux-gnu \
-  --mcpu native \
-  --opt-level=-O3 \
-  --timeout 60
+  --ir-field o3_ir
 ```
 
-Preferred system tool:
-
-```text
-llc
-```
-
-Install LLVM tools or pass an explicit `--llc /path/to/llc`.
-If system LLVM is unavailable, install `llvmlite` and use:
+To restrict labels to a target intrinsic family, add an include prefix:
 
 ```bash
 python3 scripts/label_iroptset_instructions.py \
   --split-dir runs/iroptset/splits/pilot_10k_v1 \
   --out-dir runs/iroptset/instruction_labels/pilot_10k_v1 \
-  --compile-ir-field o3_ir \
-  --backend llvmlite \
-  --target x86_64-pc-linux-gnu \
-  --mcpu generic \
-  --timeout 60
+  --ir-field o3_ir \
+  --include-prefix llvm.x86.
 ```
 
-The `llvmlite` backend uses LLVM's Python bindings to emit assembly and avoids
-the need for a separate `llc` executable. It is useful for bootstrapping, but a
-system `llc` run is still preferable for paper-grade reproducibility because
-the compiler version and command-line flags are easier to record exactly.
+The default extractor keeps all `llvm.*` call/invoke/callbr intrinsics except
+debug, lifetime, assumption, and other metadata/control-only intrinsics. Use
+`--include-prefix` and `--exclude-prefix` when a run should focus on a narrower
+instruction family.
 
 The label records include:
 
 - repository and function metadata
-- target and CPU settings
-- per-function instruction multiset
-- unique instruction list
-- compiler command or backend used to emit assembly
-- failure information for functions that do not compile
-
-Use `--keep-artifacts` to preserve generated assembly files under the label
-output directory.
+- IR field used for extraction
+- label kind (`llvm_intrinsic`)
+- per-function intrinsic multiset, also stored in the existing
+  `instruction_counts` field for downstream compatibility
+- unique intrinsic list, also stored in the existing `instructions` field
+- failure information for rows with missing IR
 
 ## First Model Baseline
 
@@ -123,10 +109,10 @@ Evaluate on the IR-OptSet validation/internal-test splits with:
 - `Recall@10`
 - `Recall@20`
 - `Recall@50`
-- mean reciprocal rank for compiler-used instructions
+- mean reciprocal rank for IR-used intrinsics
 
-Then inject the top-k retrieved instructions into the Codex assembly prompt as
-an instruction palette and evaluate only on TSVC.
+Then inject the top-k retrieved intrinsics into the Codex assembly prompt as an
+instruction palette and evaluate only on TSVC.
 
 ## Held-Out Rule
 
