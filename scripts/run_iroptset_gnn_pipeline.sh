@@ -22,6 +22,7 @@ SEED="${SEED:-17}"
 LABEL_IR_FIELD="${LABEL_IR_FIELD:-o3_ir}"
 INTRINSIC_INCLUDE_PREFIXES="${INTRINSIC_INCLUDE_PREFIXES:-}"
 INTRINSIC_EXCLUDE_PREFIXES="${INTRINSIC_EXCLUDE_PREFIXES:-}"
+INSTRUCTION_SPEC_JSONL="${INSTRUCTION_SPEC_JSONL:-}"
 
 MAX_TOKEN_VOCAB="${MAX_TOKEN_VOCAB:-20000}"
 MAX_INSTRUCTION_VOCAB="${MAX_INSTRUCTION_VOCAB:-512}"
@@ -30,6 +31,7 @@ MAX_EDGES="${MAX_EDGES:-4096}"
 
 EPOCHS="${EPOCHS:-20}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
+INSTRUCTION_BATCH_SIZE="${INSTRUCTION_BATCH_SIZE:-128}"
 HIDDEN_DIM="${HIDDEN_DIM:-128}"
 LAYERS="${LAYERS:-3}"
 DROPOUT="${DROPOUT:-0.15}"
@@ -37,11 +39,17 @@ LR="${LR:-0.001}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0001}"
 EVAL_KS="${EVAL_KS:-10,20,50}"
 DEVICE="${DEVICE:-auto}"
+TRAINER="${TRAINER:-classifier}"                 # classifier or dual
 
 SPLIT_DIR="runs/iroptset/splits/${OUT_TAG}"
 LABEL_DIR="runs/iroptset/instruction_labels/${OUT_TAG}"
 GRAPH_DIR="runs/iroptset/graphs/${OUT_TAG}"
-MODEL_DIR="runs/iroptset/models/gnn_${OUT_TAG}"
+INSTRUCTION_GRAPH_DIR="runs/iroptset/instruction_graphs/${OUT_TAG}"
+if [[ "$TRAINER" == "dual" ]]; then
+  MODEL_DIR="runs/iroptset/models/dual_gnn_${OUT_TAG}"
+else
+  MODEL_DIR="runs/iroptset/models/gnn_${OUT_TAG}"
+fi
 
 if [[ -n "$PYTHONPATH_PREFIX" ]]; then
   export PYTHONPATH="$PYTHONPATH_PREFIX${PYTHONPATH:+:$PYTHONPATH}"
@@ -94,6 +102,13 @@ fi
 
 "${label_args[@]}"
 
+if [[ -n "$INSTRUCTION_SPEC_JSONL" ]]; then
+  echo "==> Building instruction semantic graphs in ${INSTRUCTION_GRAPH_DIR}"
+  python3 scripts/build_instruction_semantic_graphs.py \
+    --spec-jsonl "$INSTRUCTION_SPEC_JSONL" \
+    --out-dir "$INSTRUCTION_GRAPH_DIR"
+fi
+
 echo "==> Building graph dataset in ${GRAPH_DIR}"
 python3 scripts/build_iroptset_graph_dataset.py \
   --split-dir "$SPLIT_DIR" \
@@ -106,21 +121,45 @@ python3 scripts/build_iroptset_graph_dataset.py \
   --max-edges "$MAX_EDGES"
 
 echo "==> Training GNN in ${MODEL_DIR}"
-python3 scripts/train_instruction_gnn.py \
-  --graph-dir "$GRAPH_DIR" \
-  --out-dir "$MODEL_DIR" \
-  --epochs "$EPOCHS" \
-  --batch-size "$BATCH_SIZE" \
-  --hidden-dim "$HIDDEN_DIM" \
-  --layers "$LAYERS" \
-  --dropout "$DROPOUT" \
-  --lr "$LR" \
-  --weight-decay "$WEIGHT_DECAY" \
-  --device "$DEVICE" \
-  --eval-ks "$EVAL_KS"
+if [[ "$TRAINER" == "dual" ]]; then
+  if [[ -z "$INSTRUCTION_SPEC_JSONL" ]]; then
+    echo "INSTRUCTION_SPEC_JSONL is required when TRAINER=dual" >&2
+    exit 2
+  fi
+  python3 scripts/train_instruction_dual_gnn.py \
+    --program-graph-dir "$GRAPH_DIR" \
+    --instruction-graph-dir "$INSTRUCTION_GRAPH_DIR" \
+    --out-dir "$MODEL_DIR" \
+    --epochs "$EPOCHS" \
+    --batch-size "$BATCH_SIZE" \
+    --instruction-batch-size "$INSTRUCTION_BATCH_SIZE" \
+    --hidden-dim "$HIDDEN_DIM" \
+    --layers "$LAYERS" \
+    --dropout "$DROPOUT" \
+    --lr "$LR" \
+    --weight-decay "$WEIGHT_DECAY" \
+    --device "$DEVICE" \
+    --eval-ks "$EVAL_KS"
+else
+  python3 scripts/train_instruction_gnn.py \
+    --graph-dir "$GRAPH_DIR" \
+    --out-dir "$MODEL_DIR" \
+    --epochs "$EPOCHS" \
+    --batch-size "$BATCH_SIZE" \
+    --hidden-dim "$HIDDEN_DIM" \
+    --layers "$LAYERS" \
+    --dropout "$DROPOUT" \
+    --lr "$LR" \
+    --weight-decay "$WEIGHT_DECAY" \
+    --device "$DEVICE" \
+    --eval-ks "$EVAL_KS"
+fi
 
 echo "==> Done"
 echo "Splits:  ${SPLIT_DIR}"
 echo "Labels:  ${LABEL_DIR}"
 echo "Graphs:  ${GRAPH_DIR}"
+if [[ -n "$INSTRUCTION_SPEC_JSONL" ]]; then
+  echo "Instr:   ${INSTRUCTION_GRAPH_DIR}"
+fi
 echo "Model:   ${MODEL_DIR}"

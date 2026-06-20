@@ -44,6 +44,88 @@ python3 scripts/prepare_benchmarks.py \
   --out runs/manifests/npb.jsonl
 ```
 
+## Source Computation Graph Example
+
+The GNN input graph is built from LLVM IR, not from generated assembly. For a
+small function:
+
+```llvm
+define i32 @scale_sum(i32 %a, i32 %b) {
+entry:
+  %x = add i32 %a, %b
+  %y = mul i32 %x, 4
+  ret i32 %y
+}
+```
+
+`scripts/build_iroptset_graph_dataset.py` turns it into a symbolic graph like:
+
+```text
+nodes
+  0  function     function
+  1  argument     arg
+  2  argument     arg
+  3  block        block_entry
+  4  instruction  add
+  5  instruction  mul
+  6  instruction  ret
+
+edges
+  function -> block_entry  contains
+  block_entry -> add       contains
+  block_entry -> mul       contains
+  block_entry -> ret       contains
+  arg -> add               def_use
+  arg -> add               def_use
+  add -> mul               next
+  add -> mul               def_use
+  mul -> ret               next
+  mul -> ret               def_use
+```
+
+The encoded dataset stores token IDs, node type IDs, and typed directed edges.
+This keeps the source-side graph small and compiler-middle-end oriented: blocks,
+IR operations, SSA definitions, uses, operands, and branch structure.
+
+The instruction side is a separate semantic graph. Each instruction or intrinsic
+gets metadata plus normalized micro-operations from its Operation pseudocode:
+
+```json
+{
+  "label": "llvm.x86.sse2.padd.w",
+  "architecture": "x86",
+  "extension": "SSE2",
+  "intrinsic": "_mm_add_epi16",
+  "instruction": "paddw xmm, xmm",
+  "cpuid": ["SSE2"],
+  "operation": [
+    "for lane in 0..7",
+    "dst.i16[lane] = a.i16[lane] + b.i16[lane]"
+  ]
+}
+```
+
+Build those instruction micro-op graphs with:
+
+```bash
+python3 scripts/build_instruction_semantic_graphs.py \
+  --spec-jsonl examples/instruction_semantics/instruction_specs.jsonl \
+  --out-dir runs/instruction_semantics/sample
+```
+
+For the dual-graph retriever, train with a program graph directory and an
+instruction graph directory:
+
+```bash
+python3 scripts/train_instruction_dual_gnn.py \
+  --program-graph-dir runs/iroptset/graphs/pilot_10k_v1 \
+  --instruction-graph-dir runs/iroptset/instruction_graphs/pilot_10k_v1 \
+  --out-dir runs/iroptset/models/dual_gnn_pilot_10k_v1
+```
+
+Or set `TRAINER=dual` and `INSTRUCTION_SPEC_JSONL=...` when using
+`scripts/run_iroptset_gnn_pipeline.sh`.
+
 
 ## GPT-5.5 Pass@1
 

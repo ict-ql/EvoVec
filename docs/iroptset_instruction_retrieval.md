@@ -94,15 +94,102 @@ The label records include:
 - unique intrinsic list, also stored in the existing `instructions` field
 - failure information for rows with missing IR
 
-## First Model Baseline
+## Instruction Semantic Graphs
 
-Before building a full GNN, train a contrastive retriever:
+The instruction side should not be represented as a bare intrinsic string. Each
+instruction/intrinsic gets a small semantic graph built from:
+
+- intrinsic or compiler builtin spelling
+- assembly instruction mnemonic/form
+- ISA architecture and extension
+- CPUID or feature flags
+- operand roles and types
+- normalized Operation pseudocode as micro-operations
+
+Example input record:
+
+```json
+{
+  "label": "llvm.x86.sse2.padd.w",
+  "architecture": "x86",
+  "extension": "SSE2",
+  "intrinsic": "_mm_add_epi16",
+  "instruction": "paddw xmm, xmm",
+  "cpuid": ["SSE2"],
+  "operands": [
+    {"name": "dst", "role": "dst", "type": "v8i16"},
+    {"name": "a", "role": "src", "type": "v8i16"},
+    {"name": "b", "role": "src", "type": "v8i16"}
+  ],
+  "operation": [
+    "for lane in 0..7",
+    "dst.i16[lane] = a.i16[lane] + b.i16[lane]"
+  ],
+  "split": "train"
+}
+```
+
+Build semantic instruction graphs with:
+
+```bash
+python3 scripts/build_instruction_semantic_graphs.py \
+  --spec-jsonl examples/instruction_semantics/instruction_specs.jsonl \
+  --out-dir runs/iroptset/instruction_graphs/pilot_10k_v1
+```
+
+The graph builder creates instruction, intrinsic, assembly, ISA, CPUID, operand,
+type, micro-op, operator, constant, and predicate nodes. The micro-op graph is
+deliberately normalized: it should capture the operation's dataflow, lane
+structure, masks, reductions, extension operations, and accumulation behavior
+without depending on backend lowering.
+
+For x86, the raw material should come from the Intel Intrinsics Guide or its
+offline data export. For RVV, use RVV intrinsic/spec tables. Store only the
+normalized JSONL records in this repo so the model sees a stable schema rather
+than page-specific formatting.
+
+## ISA Split Policy
+
+The first experiment should be explicit about the instruction distribution:
+
+- x86 training: SSE, SSE2, SSE3, SSSE3, SSE4.x, AVX, F16C, FMA, AVX2
+- x86 validation: AVX-VNNI and AVX-VNNI-INT8, if enough records are available
+- x86 held-out test: AVX-512 VNNI, BF16, and FP16-style instructions
+- cross-ISA training: RVV records, kept with `architecture=riscv` and
+  `extension=RVV`
+
+The point of the AVX-512/VNNI holdout is to test whether the model can use the
+micro-op semantics of newer dot-product and mixed-precision instructions rather
+than only memorizing x86 intrinsic names. The point of the RVV records is to
+teach vector lane, mask, and `vl` semantics in a cross-ISA way while keeping ISA
+metadata explicit.
+
+The machine-readable policy lives in:
 
 ```text
-program encoder(preprocessed_ir) -> embedding
-instruction encoder(instruction metadata / semantic graph) -> embedding
+config/instruction_semantic_splits.json
+```
+
+## First Model Baseline
+
+The semantic path trains a dual-graph contrastive retriever:
+
+```text
+program encoder(preprocessed_ir computation graph) -> embedding
+instruction encoder(instruction micro-op semantic graph) -> embedding
 score = dot(program_embedding, instruction_embedding)
 ```
+
+```bash
+python3 scripts/train_instruction_dual_gnn.py \
+  --program-graph-dir runs/iroptset/graphs/pilot_10k_v1 \
+  --instruction-graph-dir runs/iroptset/instruction_graphs/pilot_10k_v1 \
+  --out-dir runs/iroptset/models/dual_gnn_pilot_10k_v1
+```
+
+The older classifier path is still available for ablations, but it should be
+treated as a label-only baseline because it does not encode instruction
+micro-op graphs.
 
 Evaluate on the IR-OptSet validation/internal-test splits with:
 

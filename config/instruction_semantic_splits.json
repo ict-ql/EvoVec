@@ -1,0 +1,31 @@
+{
+  "label_source": "intrinsic_micro_ops",
+  "train_extensions": [
+    "x86:SSE",
+    "x86:SSE2",
+    "x86:SSE3",
+    "x86:SSSE3",
+    "x86:SSE4.1",
+    "x86:SSE4.2",
+    "x86:AVX",
+    "x86:F16C",
+    "x86:FMA",
+    "x86:AVX2",
+    "riscv:RVV"
+  ],
+  "validation_extensions": [
+    "x86:AVX_VNNI",
+    "x86:AVX_VNNI_INT8"
+  ],
+  "test_extensions": [
+    "x86:AVX512_VNNI",
+    "x86:AVX512_BF16",
+    "x86:AVX512_FP16"
+  ],
+  "holdout_policy": "Keep AVX-512/VNNI-style instructions out of the primary x86 SSE/AVX training set so the instruction semantic graph is tested on newer dot-product and mixed-precision operations that compilers often expose unevenly.",
+  "notes": [
+    "Use normalized Operation pseudocode as micro-op supervision instead of backend assembly mnemonics.",
+    "Keep architecture and extension metadata explicit so cross-ISA RVV examples can be trained without pretending they are x86 labels.",
+    "Prefer one canonical semantic record per instruction/intrinsic lowering, with aliases recorded as metadata."
+  ]
+}
