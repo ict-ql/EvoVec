@@ -6,9 +6,9 @@ import json
 from pathlib import Path
 
 try:
-    from build_iroptset_graph_dataset import parse_ir_to_symbolic_graph
+    from mini_programl_graphs import compact_graph_features, compact_node_features, parse_program_ir_to_graph
 except ModuleNotFoundError:  # pragma: no cover - used when imported as a package module
-    from scripts.build_iroptset_graph_dataset import parse_ir_to_symbolic_graph
+    from scripts.mini_programl_graphs import compact_graph_features, compact_node_features, parse_program_ir_to_graph
 
 
 def main() -> int:
@@ -17,15 +17,18 @@ def main() -> int:
     parser.add_argument("--max-nodes", type=int, default=512)
     parser.add_argument("--max-edges", type=int, default=4096)
     parser.add_argument("--max-operand-nodes", type=int, default=128)
+    parser.add_argument("--include-debug-text", action="store_true")
     parser.add_argument("--out", type=Path)
     args = parser.parse_args()
 
-    graph = parse_ir_to_symbolic_graph(
+    graph = parse_program_ir_to_graph(
         args.ir_file.read_text(encoding="utf-8"),
         args.max_nodes,
         args.max_edges,
         args.max_operand_nodes,
     )
+    graph["node_features"] = compact_node_features(graph["node_features"], args.include_debug_text)
+    graph["graph_features"] = compact_graph_features(graph.get("graph_features", {}), args.include_debug_text)
     graph["ir_file"] = str(args.ir_file)
     text = json.dumps(graph, indent=2, sort_keys=True)
     if args.out:

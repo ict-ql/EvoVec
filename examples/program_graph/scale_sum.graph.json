@@ -1,123 +1,202 @@
 {
+  "edge_features": [
+    {},
+    {},
+    {},
+    {
+      "role": "def"
+    },
+    {},
+    {
+      "role": "use"
+    },
+    {
+      "role": "use"
+    },
+    {},
+    {},
+    {
+      "role": "def"
+    },
+    {},
+    {
+      "role": "use"
+    },
+    {},
+    {
+      "role": "constant"
+    },
+    {},
+    {},
+    {
+      "role": "use"
+    }
+  ],
   "edges": [
     [
+      2,
       0,
-      3,
-      "contains"
+      "type",
+      0
     ],
     [
-      3,
-      0,
-      "contained_by"
-    ],
-    [
-      3,
-      4,
-      "contains"
-    ],
-    [
-      4,
-      3,
-      "contained_by"
-    ],
-    [
+      2,
       1,
-      4,
-      "def_use"
-    ],
-    [
-      4,
-      1,
-      "use_def"
+      "type",
+      0
     ],
     [
       2,
       4,
-      "def_use"
+      "type",
+      0
     ],
     [
+      3,
       4,
+      "data",
+      0
+    ],
+    [
       2,
-      "use_def"
+      3,
+      "type",
+      0
+    ],
+    [
+      0,
+      3,
+      "data",
+      0
+    ],
+    [
+      1,
+      3,
+      "data",
+      1
     ],
     [
       3,
       5,
-      "contains"
+      "control",
+      0
+    ],
+    [
+      2,
+      6,
+      "type",
+      0
     ],
     [
       5,
-      3,
-      "contained_by"
+      6,
+      "data",
+      0
+    ],
+    [
+      2,
+      5,
+      "type",
+      0
     ],
     [
       4,
       5,
-      "next"
+      "data",
+      0
+    ],
+    [
+      2,
+      7,
+      "type",
+      0
+    ],
+    [
+      7,
+      5,
+      "data",
+      1
     ],
     [
       5,
-      4,
-      "prev"
+      8,
+      "control",
+      0
     ],
     [
-      4,
-      5,
-      "def_use"
-    ],
-    [
-      5,
-      4,
-      "use_def"
-    ],
-    [
-      3,
-      6,
-      "contains"
-    ],
-    [
-      6,
-      3,
-      "contained_by"
-    ],
-    [
-      5,
-      6,
-      "next"
+      2,
+      8,
+      "type",
+      0
     ],
     [
       6,
-      5,
-      "prev"
-    ],
-    [
-      5,
-      6,
-      "def_use"
-    ],
-    [
-      6,
-      5,
-      "use_def"
+      8,
+      "data",
+      0
     ]
   ],
+  "graph_features": {
+    "blocks": [
+      {
+        "index": 0,
+        "name": "entry"
+      }
+    ],
+    "source": "llvm_ir"
+  },
+  "graph_kind": "program",
+  "graph_schema": "mini-programl",
   "ir_file": "examples\\program_graph\\scale_sum.ll",
+  "node_features": [
+    {
+      "origin": "argument"
+    },
+    {
+      "origin": "argument"
+    },
+    {
+      "data_type": "i32"
+    },
+    {
+      "block": 0
+    },
+    {
+      "origin": "ssa_def"
+    },
+    {
+      "block": 0
+    },
+    {
+      "origin": "ssa_def"
+    },
+    {
+      "value": "4"
+    },
+    {
+      "block": 0
+    }
+  ],
   "node_tokens": [
-    "function",
-    "arg",
-    "arg",
-    "block_entry",
+    "var",
+    "var",
+    "i32",
     "add",
+    "var",
     "mul",
+    "var",
+    "val",
     "ret"
   ],
   "node_types": [
-    "function",
-    "argument",
-    "argument",
-    "block",
+    "variable",
+    "variable",
+    "type",
     "instruction",
+    "variable",
     "instruction",
+    "variable",
+    "constant",
     "instruction"
   ]
 }

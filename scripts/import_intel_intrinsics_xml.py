@@ -88,9 +88,15 @@ def operands(element: ET.Element) -> list[dict[str, str]]:
             "name": name,
             "role": operand_role(child.tag),
             "type": child.attrib.get("etype") or child.attrib.get("type", ""),
+            "ctype": child.attrib.get("type", ""),
+            "etype": child.attrib.get("etype", ""),
         }
         if child.attrib.get("memwidth"):
             operand["memwidth"] = child.attrib["memwidth"]
+        if child.attrib.get("immwidth"):
+            operand["immwidth"] = child.attrib["immwidth"]
+        if child.attrib.get("etype") == "IMM":
+            operand["is_imm"] = "true"
         items.append(operand)
     return items
 
@@ -125,19 +131,58 @@ def llvm_aliases(extension: str, instructions: list[str]) -> list[str]:
     return aliases
 
 
-def spec_from_intrinsic(element: ET.Element) -> dict[str, Any]:
+def instruction_records(element: ET.Element) -> list[dict[str, str]]:
+    records: list[dict[str, str]] = []
+    for instruction in element.findall("instruction"):
+        records.append(
+            {
+                "name": instruction.attrib.get("name", ""),
+                "form": instruction.attrib.get("form", ""),
+                "xed": instruction.attrib.get("xed", ""),
+            }
+        )
+    return records
+
+
+def load_alias_map(path: Path | None) -> dict[str, list[str]]:
+    if path is None:
+        return {}
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    mapping: dict[str, list[str]] = {}
+    for key, value in raw.items():
+        if isinstance(value, str):
+            mapping[str(key)] = [value]
+        else:
+            mapping[str(key)] = [str(item) for item in value]
+    return mapping
+
+
+def spec_from_intrinsic(element: ET.Element, alias_map: dict[str, list[str]] | None = None) -> dict[str, Any]:
     intrinsic = element.attrib.get("name", "")
     extension = extension_from_intrinsic(element)
     instructions = instruction_texts(element)
     cpuid = [clean_text(child.text) for child in element.findall("CPUID") if clean_text(child.text)]
-    aliases = [intrinsic, *instructions, *[text.split()[0].lower() for text in instructions], *llvm_aliases(extension, instructions)]
-    label = aliases[-1] if aliases else f"x86.{intrinsic.lstrip('_')}"
+    llvm_intrinsics = list(dict.fromkeys((alias_map or {}).get(intrinsic, [])))
+    heuristic_aliases = llvm_aliases(extension, instructions)
+    aliases = [
+        intrinsic,
+        *instructions,
+        *[text.split()[0].lower() for text in instructions],
+        *llvm_intrinsics,
+        *heuristic_aliases,
+    ]
+    label = llvm_intrinsics[0] if llvm_intrinsics else (heuristic_aliases[-1] if heuristic_aliases else f"x86.{intrinsic.lstrip('_')}")
+    inst_records = instruction_records(element)
     return {
         "label": label,
         "architecture": "x86",
         "extension": extension,
         "intrinsic": intrinsic,
+        "llvm_intrinsic": llvm_intrinsics[0] if llvm_intrinsics else "",
+        "llvm_intrinsics": llvm_intrinsics,
         "instruction": primary_instruction(element),
+        "instruction_forms": inst_records,
+        "xed": inst_records[0]["xed"] if inst_records else "",
         "aliases": list(dict.fromkeys(alias for alias in aliases if alias)),
         "cpuid": cpuid,
         "category": clean_text(element.findtext("category")),
@@ -145,7 +190,7 @@ def spec_from_intrinsic(element: ET.Element) -> dict[str, Any]:
         "header": clean_text(element.findtext("header")),
         "operands": operands(element),
         "operation": operation_lines(element),
-        "source": "intel_intrinsics_xml",
+        "source": "vegen_intel_intrinsics_xml",
     }
 
 
@@ -176,26 +221,31 @@ def parse_extensions(values: list[str] | None) -> set[str]:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Convert Intel/Vegen intrinsics XML into instruction micro-op spec JSONL."
+        description="Convert Intel/Vegen intrinsics XML into instruction Operation spec JSONL."
     )
     parser.add_argument("--xml", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--include-extension", action="append")
     parser.add_argument("--exclude-extension", action="append")
+    parser.add_argument("--llvm-alias-map", type=Path, help="JSON map from C intrinsic names to final llvm.* names.")
     parser.add_argument("--limit", type=int, default=0)
     args = parser.parse_args()
 
     include_extensions = parse_extensions(args.include_extension)
     exclude_extensions = parse_extensions(args.exclude_extension)
+    alias_map = load_alias_map(args.llvm_alias_map)
     root = ET.parse(args.xml).getroot()
     rows: list[dict[str, Any]] = []
     extension_counts: Counter[str] = Counter()
+    llvm_alias_hits = 0
     for element in root.findall("intrinsic"):
-        record = spec_from_intrinsic(element)
+        record = spec_from_intrinsic(element, alias_map)
         if not include_record(record, include_extensions, exclude_extensions):
             continue
         rows.append(record)
         extension_counts[str(record["extension"])] += 1
+        if record.get("llvm_intrinsic"):
+            llvm_alias_hits += 1
         if args.limit > 0 and len(rows) >= args.limit:
             break
 
@@ -204,6 +254,7 @@ def main() -> int:
         "input": str(args.xml),
         "out": str(args.out),
         "rows": len(rows),
+        "llvm_alias_hits": llvm_alias_hits,
         "extensions": extension_counts.most_common(),
     }
     print(json.dumps(summary, sort_keys=True))

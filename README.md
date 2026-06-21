@@ -46,8 +46,14 @@ python3 scripts/prepare_benchmarks.py \
 
 ## Source Computation Graph Example
 
-The GNN input graph is built from LLVM IR, not from generated assembly. For a
-small function:
+The GNN input graph is built from LLVM IR, not from generated assembly. The
+default representation is `mini-programl`: a small ProGraML-style directed
+multigraph with `INSTRUCTION`, `VARIABLE`, `CONSTANT`, and `TYPE` nodes.
+Edges have ProGraML-like `control`, `data`, or `type` flow, plus numeric
+positions and lightweight features such as `backedge`. We omit call edges
+because this experiment is function/intrinsic retrieval oriented.
+
+For a small function:
 
 ```llvm
 define i32 @scale_sum(i32 %a, i32 %b) {
@@ -58,7 +64,7 @@ entry:
 }
 ```
 
-`scripts/build_iroptset_graph_dataset.py` turns it into a symbolic graph. The
+`scripts/build_mini_programl_graph.py` turns it into a symbolic graph. The
 checked-in example is:
 
 ```text
@@ -73,37 +79,151 @@ python3 scripts/inspect_program_graph.py \
   --out examples/program_graph/scale_sum.graph.json
 ```
 
+The same standalone parser is the inference-time entry point:
+
+```bash
+python3 scripts/build_mini_programl_graph.py \
+  --mode program \
+  --ir-file examples/program_graph/scale_sum.ll \
+  --vocab runs/iroptset/graphs/pilot_10k_v1/vocab.json \
+  --out runs/inference/scale_sum.program_graph.json
+```
+
+Compact symbolic output interns each normalized type as one `type` node. Only
+that node keeps `data_type`; typed variables, constants, and instructions point
+to it with `type` edges. SSA names such as `%x`, `%y`, `%1`, and `%2` are
+debug-only text, while trainable variable tokens stay canonical as `var`.
+
 Readable sketch:
 
 ```text
 nodes
-  0  function     function
-  1  argument     arg
-  2  argument     arg
-  3  block        block_entry
-  4  instruction  add
+  0  variable     %a
+  1  variable     %b
+  2  type         i32
+  3  instruction  add
+  4  variable     %x
   5  instruction  mul
-  6  instruction  ret
+  6  variable     %y
+  7  constant     4
+  8  instruction  ret
 
 edges
-  function -> block_entry  contains
-  block_entry -> add       contains
-  block_entry -> mul       contains
-  block_entry -> ret       contains
-  arg -> add               def_use
-  arg -> add               def_use
-  add -> mul               next
-  add -> mul               def_use
-  mul -> ret               next
-  mul -> ret               def_use
+  i32 -> %a                type
+  i32 -> %b                type
+  i32 -> add               type
+  add -> %x                data(position=0, role=def)
+  i32 -> %x                type
+  %a -> add                data(position=0, role=use)
+  %b -> add                data(position=1, role=use)
+  add -> mul               control
+  i32 -> mul               type
+  mul -> %y                data(position=0, role=def)
+  i32 -> %y                type
+  %x -> mul                data(position=0, role=use)
+  i32 -> 4                 type
+  4 -> mul                 data(role=constant)
+  mul -> ret               control
+  i32 -> ret               type
+  %y -> ret                data(position=0, role=use)
 ```
 
-The encoded dataset stores token IDs, node type IDs, and typed directed edges.
-This keeps the source-side graph small and compiler-middle-end oriented: blocks,
-IR operations, SSA definitions, uses, operands, and branch structure.
+The encoded dataset stores token IDs, node type IDs, typed directed edges, and
+edge positions. Loops are visible as control-flow cycles; backedges are marked
+in edge features when a terminator branches to an earlier block.
 
-The instruction side is a separate semantic graph. Each instruction or intrinsic
-gets metadata plus normalized micro-operations from its Operation pseudocode:
+Training currently tensorizes only these graph fields into the GNN encoder:
+
+```text
+node_token_ids      -> node_tokens
+node_type_ids       -> node_types
+edges[:, 0]         -> edge_src
+edges[:, 1]         -> edge_dst
+edges[:, 2]         -> edge_types
+edges[:, 3]         -> edge_positions
+edge_feature_ids    -> edge_features
+edge_counts         -> edge_counts
+```
+
+`graph_ids` is created during batching for graph-level pooling, and `label_ids`
+is used as retrieval supervision. Symbolic inspection fields such as
+`node_features`, `graph_features`, `node_tokens`, `node_types`, and
+`edge_features` are not consumed by the trainer unless they are first encoded
+into the tensor fields above.
+
+For the paper path, do not train instruction recommendation from function-level
+bags. Use before/after graph diffs to extract changed scalar regions, then train
+a changed-region detector and an intrinsic matcher on those regions. The
+function-level dual-graph trainer is kept only as a pilot baseline until the
+diff-supervised region dataset is built.
+
+Start with LLVM's focused X86 vectorizer tests rather than IR-OptSet:
+
+```bash
+python3 scripts/build_llvm_vectorize_region_dataset.py \
+  --llvm-project-root /path/to/llvm-project \
+  --opt /path/to/llvm-project/build/bin/opt \
+  --out-dir runs/llvm_vectorize_regions/x86_v1
+```
+
+The script reads:
+
+```text
+llvm/test/Transforms/LoopVectorize/X86
+llvm/test/Transforms/SLPVectorizer/X86
+```
+
+It runs `opt`, extracts changed scalar regions from before/after IR graph
+diffs, emits train/val/test `.regions.jsonl`, and writes synthetic instruction
+specs for observed vector IR operations:
+
+```text
+runs/llvm_vectorize_regions/x86_v1/vector_instruction_specs.jsonl
+```
+
+Build instruction graphs for those observed labels:
+
+```bash
+python3 scripts/build_instruction_semantic_graphs.py \
+  --spec-jsonl runs/llvm_vectorize_regions/x86_v1/vector_instruction_specs.jsonl \
+  --out-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs
+```
+
+If the collected labels include real `llvm.x86.*` intrinsics, pass the imported
+Intel/Vegen intrinsic spec JSONL in the same `--spec-jsonl` list so those labels
+also have instruction graphs.
+
+Then train the changed-region detector plus intrinsic/vector-op matcher:
+
+```bash
+python3 scripts/train_region_intrinsic_model.py \
+  --region-dir runs/llvm_vectorize_regions/x86_v1 \
+  --instruction-graph-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs \
+  --out-dir runs/llvm_vectorize_regions/models/region_intrinsic_x86_v1
+```
+
+On Ubuntu, run these commands from the repository root. The scripts are portable
+Python and do not require Windows paths or PowerShell, but the server must have:
+
+```bash
+python3 --version
+python3 -m pip install torch
+/path/to/llvm-project/build/bin/opt --version
+```
+
+The LLVM `opt` binary should come from the same LLVM checkout as the test
+directories when possible. If the first collection run fails, inspect
+`runs/llvm_vectorize_regions/x86_v1/summary.json`; failed tests are recorded
+there with the `opt` stderr.
+
+The instruction side uses the same `mini-programl` idea. Each instruction or
+intrinsic gets metadata plus a Vegen-style Operation graph. The Operation text
+is parsed into statements and expressions such as `For`, `Update`,
+`BitSlice`, `BinaryExpr`, `Var`, and `Number`; those AST nodes are then lowered
+to mini-ProGraML. Symbols in the pseudocode, including temporaries and loop
+indices, become variable nodes; arithmetic/effectful expressions and bit slices
+become instruction nodes; static loops get a control self-loop with
+execution-count features.
 
 ```json
 {
@@ -114,13 +234,50 @@ gets metadata plus normalized micro-operations from its Operation pseudocode:
   "instruction": "paddw xmm, xmm",
   "cpuid": ["SSE2"],
   "operation": [
-    "for lane in 0..7",
-    "dst.i16[lane] = a.i16[lane] + b.i16[lane]"
+    "FOR j := 0 to 7",
+    "i := j*16",
+    "dst[i+15:i] := a[i+15:i] + b[i+15:i]",
+    "ENDFOR"
   ]
 }
 ```
 
-Build those instruction micro-op graphs with:
+This produces variable nodes such as `j`, `i`, `dst`, `a`, and `b`. The loop
+node has a `control` self-loop; for `0 to 7`, the loop body has
+`iteration_count=8` and the self-loop/backedge has `execution_count=7`.
+
+Readable intrinsic sketch:
+
+```text
+nodes
+  instruction  for
+  variable     j
+  instruction  mul
+  variable     i
+  instruction  add
+  instruction  slice       a[i+15:i]
+  instruction  slice       b[i+15:i]
+  instruction  slice       dst[i+15:i]
+  variable     dst
+  variable     a
+  variable     b
+
+edges
+  for -> for        control(backedge=true, iteration_count=8, execution_count=7)
+  for -> j          data(role=induction_def)
+  j -> mul          data(role=use, execution_count=8)
+  16 -> mul         data(role=constant, execution_count=8)
+  mul -> i          data(role=def, execution_count=8)
+  a -> slice        data(role=base, execution_count=8)
+  i + 15 -> slice   data(role=hi, execution_count=8)
+  i -> slice        data(role=lo, execution_count=8)
+  slice(a) -> add   data(role=lhs, execution_count=8)
+  slice(b) -> add   data(role=rhs, execution_count=8)
+  dst -> slice      data(role=base, execution_count=8)
+  add -> slice(dst) data(role=def, execution_count=8)
+```
+
+Build those instruction Operation graphs with:
 
 ```bash
 python3 scripts/build_instruction_semantic_graphs.py \
@@ -129,12 +286,33 @@ python3 scripts/build_instruction_semantic_graphs.py \
   --out-dir runs/instruction_semantics/sample
 ```
 
+For one-off inspection or inference-time construction of an intrinsic graph,
+use the same standalone parser with intrinsic mode:
+
+```bash
+python3 scripts/build_mini_programl_graph.py \
+  --mode intrinsic \
+  --spec-jsonl examples/instruction_semantics/instruction_specs.jsonl \
+  --out runs/inference/intrinsic_graphs.jsonl
+```
+
 To convert Intel/Vegen Intrinsics Guide XML into the spec JSONL format:
 
 ```bash
 python3 scripts/import_intel_intrinsics_xml.py \
   --xml /path/to/data-latest.xml \
+  --llvm-alias-map runs/instruction_semantics/x86_llvm_aliases.json \
   --out runs/instruction_semantics/intel_intrinsics.jsonl
+```
+
+Build that alias map with Vegen-style wrappers:
+
+```bash
+python3 scripts/build_x86_intrinsic_alias_map.py \
+  --xml /path/to/data-latest.xml \
+  --emit-wrapper-c runs/instruction_semantics/x86_wrappers.c \
+  --compile-ir runs/instruction_semantics/x86_wrappers.ll \
+  --out runs/instruction_semantics/x86_llvm_aliases.json
 ```
 
 For the dual-graph retriever, train with a program graph directory and an
@@ -149,7 +327,8 @@ python3 scripts/train_instruction_dual_gnn.py \
 
 When using `scripts/run_iroptset_gnn_pipeline.sh`, set
 `INSTRUCTION_SPEC_JSONL=...`. The pipeline always trains the dual-graph
-retriever.
+retriever. It filters train labels through `train.instruction_graphs.jsonl` and
+uses `MAX_TRAIN_EXAMPLES_PER_INSTRUCTION` to cap very common labels.
 
 
 ## GPT-5.5 Pass@1

@@ -29,12 +29,15 @@ MAX_TOKEN_VOCAB="${MAX_TOKEN_VOCAB:-20000}"
 MAX_INSTRUCTION_VOCAB="${MAX_INSTRUCTION_VOCAB:-512}"
 MAX_NODES="${MAX_NODES:-512}"
 MAX_EDGES="${MAX_EDGES:-4096}"
+MAX_TRAIN_EXAMPLES_PER_INSTRUCTION="${MAX_TRAIN_EXAMPLES_PER_INSTRUCTION:-256}"
 
 EPOCHS="${EPOCHS:-20}"
 BATCH_SIZE="${BATCH_SIZE:-16}"
 INSTRUCTION_BATCH_SIZE="${INSTRUCTION_BATCH_SIZE:-128}"
 HIDDEN_DIM="${HIDDEN_DIM:-128}"
 LAYERS="${LAYERS:-3}"
+MAX_EDGE_POSITION="${MAX_EDGE_POSITION:-32}"
+MAX_EDGE_COUNT="${MAX_EDGE_COUNT:-128}"
 DROPOUT="${DROPOUT:-0.15}"
 LR="${LR:-0.001}"
 WEIGHT_DECAY="${WEIGHT_DECAY:-0.0001}"
@@ -113,12 +116,14 @@ echo "==> Building graph dataset in ${GRAPH_DIR}"
 python3 scripts/build_iroptset_graph_dataset.py \
   --split-dir "$SPLIT_DIR" \
   --label-dir "$LABEL_DIR" \
+  --instruction-graph-dir "$INSTRUCTION_GRAPH_DIR" \
   --out-dir "$GRAPH_DIR" \
   --ir-field preprocessed_ir \
   --max-token-vocab "$MAX_TOKEN_VOCAB" \
   --max-instruction-vocab "$MAX_INSTRUCTION_VOCAB" \
   --max-nodes "$MAX_NODES" \
-  --max-edges "$MAX_EDGES"
+  --max-edges "$MAX_EDGES" \
+  --max-train-examples-per-instruction "$MAX_TRAIN_EXAMPLES_PER_INSTRUCTION"
 
 echo "==> Training GNN in ${MODEL_DIR}"
 python3 scripts/train_instruction_dual_gnn.py \
@@ -130,6 +135,8 @@ python3 scripts/train_instruction_dual_gnn.py \
   --instruction-batch-size "$INSTRUCTION_BATCH_SIZE" \
   --hidden-dim "$HIDDEN_DIM" \
   --layers "$LAYERS" \
+  --max-edge-position "$MAX_EDGE_POSITION" \
+  --max-edge-count "$MAX_EDGE_COUNT" \
   --dropout "$DROPOUT" \
   --lr "$LR" \
   --weight-decay "$WEIGHT_DECAY" \

@@ -50,6 +50,9 @@ def batch_graphs(torch, rows: list[dict[str, Any]], start: int, batch_size: int,
     edge_src: list[int] = []
     edge_dst: list[int] = []
     edge_types: list[int] = []
+    edge_positions: list[int] = []
+    edge_features: list[int] = []
+    edge_counts: list[int] = []
 
     node_offset = 0
     for graph_index, row in enumerate(selected):
@@ -58,10 +61,16 @@ def batch_graphs(torch, rows: list[dict[str, Any]], start: int, batch_size: int,
         node_tokens.extend(tokens)
         node_types.extend(types)
         graph_ids.extend([graph_index] * len(tokens))
-        for src, dst, edge_type in row["edges"]:
+        row_edge_features = row.get("edge_feature_ids", [])
+        row_edge_counts = row.get("edge_counts", [])
+        for edge_index, edge in enumerate(row["edges"]):
+            src, dst, edge_type = edge[:3]
             edge_src.append(int(src) + node_offset)
             edge_dst.append(int(dst) + node_offset)
             edge_types.append(int(edge_type))
+            edge_positions.append(int(edge[3]) if len(edge) > 3 else 0)
+            edge_features.append(int(row_edge_features[edge_index]) if edge_index < len(row_edge_features) else 0)
+            edge_counts.append(int(row_edge_counts[edge_index]) if edge_index < len(row_edge_counts) else 0)
         node_offset += len(tokens)
 
     if not node_tokens:
@@ -75,6 +84,9 @@ def batch_graphs(torch, rows: list[dict[str, Any]], start: int, batch_size: int,
         "edge_src": torch.tensor(edge_src, dtype=torch.long, device=device),
         "edge_dst": torch.tensor(edge_dst, dtype=torch.long, device=device),
         "edge_types": torch.tensor(edge_types, dtype=torch.long, device=device),
+        "edge_positions": torch.tensor(edge_positions, dtype=torch.long, device=device),
+        "edge_features": torch.tensor(edge_features, dtype=torch.long, device=device),
+        "edge_counts": torch.tensor(edge_counts, dtype=torch.long, device=device),
         "batch_size": len(selected),
     }
 
@@ -98,6 +110,9 @@ class RelationalGraphEncoder:
         token_vocab_size: int,
         node_type_count: int,
         edge_type_count: int,
+        edge_feature_count: int,
+        max_edge_position: int,
+        max_edge_count: int,
         hidden_dim: int,
         layers: int,
         dropout: float,
@@ -107,6 +122,9 @@ class RelationalGraphEncoder:
                 super().__init__()
                 self.token_emb = nn.Embedding(token_vocab_size, hidden_dim, padding_idx=0)
                 self.type_emb = nn.Embedding(node_type_count, hidden_dim)
+                self.position_emb = nn.Embedding(max_edge_position + 1, hidden_dim)
+                self.edge_feature_emb = nn.Embedding(edge_feature_count, hidden_dim)
+                self.edge_count_emb = nn.Embedding(max_edge_count + 1, hidden_dim)
                 self.input_norm = nn.LayerNorm(hidden_dim)
                 self.self_linears = nn.ModuleList(
                     [nn.Linear(hidden_dim, hidden_dim) for _ in range(layers)]
@@ -133,13 +151,22 @@ class RelationalGraphEncoder:
                 edge_src = batch["edge_src"]
                 edge_dst = batch["edge_dst"]
                 edge_types = batch["edge_types"]
+                edge_positions = batch["edge_positions"].clamp(max=self.position_emb.num_embeddings - 1)
+                edge_features = batch["edge_features"].clamp(max=self.edge_feature_emb.num_embeddings - 1)
+                edge_counts = batch["edge_counts"].clamp(max=self.edge_count_emb.num_embeddings - 1)
                 for layer_index, self_linear in enumerate(self.self_linears):
                     agg = torch.zeros_like(h)
                     if edge_src.numel() > 0:
                         for edge_type, edge_linear in enumerate(self.edge_linears[layer_index]):
                             mask = edge_types == edge_type
                             if mask.any():
-                                msg = edge_linear(h[edge_src[mask]])
+                                positioned = (
+                                    h[edge_src[mask]]
+                                    + self.position_emb(edge_positions[mask])
+                                    + self.edge_feature_emb(edge_features[mask])
+                                    + self.edge_count_emb(edge_counts[mask])
+                                )
+                                msg = edge_linear(positioned)
                                 agg.index_add_(0, edge_dst[mask], msg)
                     deg = torch.ones((h.shape[0], 1), dtype=h.dtype, device=h.device)
                     if edge_dst.numel() > 0:
@@ -194,13 +221,20 @@ def align_program_rows(
         keys.extend(str(item) for item in row.get("aliases", []) if str(item))
         for key in keys:
             instruction_by_label.setdefault(key, row)
-    candidate_labels = [
-        label
-        for _label_id, label in sorted(id_to_instruction.items())
-        if label in instruction_by_label
-    ]
-    label_to_candidate = {label: index for index, label in enumerate(candidate_labels)}
-    candidates = [instruction_by_label[label] for label in candidate_labels]
+    candidate_labels: list[str] = []
+    candidates: list[dict[str, Any]] = []
+    label_to_candidate: dict[str, int] = {}
+    canonical_to_candidate: dict[str, int] = {}
+    for _label_id, label in sorted(id_to_instruction.items()):
+        row = instruction_by_label.get(label)
+        if row is None:
+            continue
+        canonical = str(row["label"])
+        if canonical not in canonical_to_candidate:
+            canonical_to_candidate[canonical] = len(candidates)
+            candidate_labels.append(canonical)
+            candidates.append(row)
+        label_to_candidate[label] = canonical_to_candidate[canonical]
     if not candidates:
         raise SystemExit("none of the program labels have matching instruction semantic graphs")
 
@@ -329,7 +363,7 @@ def train_epoch(
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Train a dual-graph GNN retriever over program graphs and instruction micro-op graphs."
+        description="Train a dual-graph GNN retriever over program graphs and instruction Operation graphs."
     )
     parser.add_argument("--program-graph-dir", type=Path, required=True)
     parser.add_argument("--instruction-graph-dir", type=Path, required=True)
@@ -339,6 +373,8 @@ def main() -> int:
     parser.add_argument("--instruction-batch-size", type=int, default=128)
     parser.add_argument("--hidden-dim", type=int, default=128)
     parser.add_argument("--layers", type=int, default=3)
+    parser.add_argument("--max-edge-position", type=int, default=32)
+    parser.add_argument("--max-edge-count", type=int, default=128)
     parser.add_argument("--dropout", type=float, default=0.15)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight-decay", type=float, default=1e-4)
@@ -394,6 +430,9 @@ def main() -> int:
         token_vocab_size=len(program_vocab["token_to_id"]),
         node_type_count=len(program_vocab["node_type_to_id"]),
         edge_type_count=len(program_vocab["edge_type_to_id"]),
+        edge_feature_count=len(program_vocab.get("edge_feature_to_id", {"none": 0})),
+        max_edge_position=args.max_edge_position,
+        max_edge_count=args.max_edge_count,
         hidden_dim=args.hidden_dim,
         layers=args.layers,
         dropout=args.dropout,
@@ -405,6 +444,9 @@ def main() -> int:
         token_vocab_size=len(instruction_vocab["token_to_id"]),
         node_type_count=len(instruction_vocab["node_type_to_id"]),
         edge_type_count=len(instruction_vocab["edge_type_to_id"]),
+        edge_feature_count=len(instruction_vocab.get("edge_feature_to_id", {"none": 0})),
+        max_edge_position=args.max_edge_position,
+        max_edge_count=args.max_edge_count,
         hidden_dim=args.hidden_dim,
         layers=args.layers,
         dropout=args.dropout,
@@ -429,6 +471,8 @@ def main() -> int:
         "instruction_batch_size": args.instruction_batch_size,
         "hidden_dim": args.hidden_dim,
         "layers": args.layers,
+        "max_edge_position": args.max_edge_position,
+        "max_edge_count": args.max_edge_count,
         "dropout": args.dropout,
         "lr": args.lr,
         "weight_decay": args.weight_decay,

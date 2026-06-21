@@ -97,14 +97,14 @@ The label records include:
 ## Instruction Semantic Graphs
 
 The instruction side should not be represented as a bare intrinsic string. Each
-instruction/intrinsic gets a small semantic graph built from:
+instruction/intrinsic gets a `mini-programl` semantic graph built from:
 
 - intrinsic or compiler builtin spelling
 - assembly instruction mnemonic/form
 - ISA architecture and extension
 - CPUID or feature flags
 - operand roles and types
-- normalized Operation pseudocode as micro-operations
+- Vegen-style parsed Operation pseudocode as a variable-level data/control graph
 
 Example input record:
 
@@ -122,8 +122,10 @@ Example input record:
     {"name": "b", "role": "src", "type": "v8i16"}
   ],
   "operation": [
-    "for lane in 0..7",
-    "dst.i16[lane] = a.i16[lane] + b.i16[lane]"
+    "FOR j := 0 to 7",
+    "i := j*16",
+    "dst[i+15:i] := a[i+15:i] + b[i+15:i]",
+    "ENDFOR"
   ],
   "split": "train"
 }
@@ -138,11 +140,27 @@ python3 scripts/build_instruction_semantic_graphs.py \
   --out-dir runs/iroptset/instruction_graphs/pilot_10k_v1
 ```
 
-The graph builder creates instruction, intrinsic, assembly, ISA, CPUID, operand,
-type, micro-op, operator, constant, and predicate nodes. The micro-op graph is
-deliberately normalized: it should capture the operation's dataflow, lane
-structure, masks, reductions, extension operations, and accumulation behavior
-without depending on backend lowering.
+The dataset builder is a wrapper around the same standalone parser used at
+inference time:
+
+```bash
+python3 scripts/build_mini_programl_graph.py \
+  --mode intrinsic \
+  --spec-jsonl examples/instruction_semantics/instruction_specs.jsonl \
+  --out runs/debug/intrinsic_graphs.jsonl
+```
+
+The graph builder creates ProGraML-style instruction, variable, constant, and
+type nodes. ISA, CPUID, intrinsic spelling, assembly form, and other metadata
+are graph or node features rather than extra fake nodes. Operation text is first
+parsed into a Vegen-style AST (`For`, `Update`, `BitSlice`, `BinaryExpr`,
+`Var`, `Number`, and friends), then lowered into mini-ProGraML. Operation
+symbols such as `j`, `i`, `dst`, `a`, and `b` become variable nodes.
+Arithmetic/effectful expressions and bit slices become instruction nodes. A
+slice such as `a[i+15:i]` has explicit `base`, `hi`, and `lo` data edges, so it
+is distinguishable from `a[i+32:i+15]`. A static loop such as
+`FOR j := 0 to 7` gets a `control` self-loop on the loop node; its body has
+`iteration_count=8`, while the self-loop/backedge has `execution_count=7`.
 
 For x86, the raw material should come from the Intel Intrinsics Guide offline
 XML data. The Vegen `data-latest.xml` file follows that shape and can be
@@ -151,12 +169,65 @@ converted directly:
 ```bash
 python3 scripts/import_intel_intrinsics_xml.py \
   --xml /path/to/data-latest.xml \
+  --llvm-alias-map runs/instruction_semantics/x86_llvm_aliases.json \
   --out runs/instruction_semantics/intel_intrinsics.jsonl
+```
+
+Build the alias map with Vegen-style C wrappers and clang-emitted LLVM IR:
+
+```bash
+python3 scripts/build_x86_intrinsic_alias_map.py \
+  --xml /path/to/data-latest.xml \
+  --emit-wrapper-c runs/instruction_semantics/x86_wrappers.c \
+  --compile-ir runs/instruction_semantics/x86_wrappers.ll \
+  --out runs/instruction_semantics/x86_llvm_aliases.json
 ```
 
 For RVV, use RVV intrinsic/spec tables. Store only the normalized JSONL records
 in this repo so the model sees a stable schema rather than page-specific
 formatting.
+
+## Mini-ProGraML Schema
+
+Both program graphs and instruction semantic graphs use the same compact
+ProGraML-inspired relation family:
+
+- `control`: execution/order structure, including instruction-to-next-
+  instruction, terminator-to-successor-entry edges, and intrinsic loop
+  self-loops
+- `data`: value use edges from SSA variables or instruction operands to
+  consuming operations, plus operation-to-defined-value edges with `role=def`;
+  intrinsic bit slices use `role=base`, `role=hi`, and `role=lo`
+- `type`: interned type nodes to variable/constant/instruction nodes
+- edge `position`: operand or successor order, following ProGraML's use of
+  positional edges
+- edge features: loop and operand-role metadata such as `backedge`,
+  `loop_header`, `iteration_count`, `execution_count`, `role=constant`, or
+  `role=def`
+- compact node features retain `data_type` only on `type` nodes. Typed
+  variables/constants/instructions must connect to the interned type node with
+  `type` edges rather than duplicating the type as a feature on every node.
+- SSA identifiers are debug-only. Graphs must canonicalize SSA variables to
+  stable tokens such as `var`, so `%x + %y` and `%1 + %2` produce the same
+  trainable graph when their structure, opcodes, constants, and types match.
+
+Call edges are intentionally omitted for this experiment.
+
+Both modes go through `scripts/mini_programl_graphs.py`:
+
+```text
+parse_mini_programl(mode="program", source=llvm_ir)
+parse_mini_programl(mode="intrinsic", source=intrinsic_spec_record)
+```
+
+For a one-off program graph, use:
+
+```bash
+python3 scripts/build_mini_programl_graph.py \
+  --mode program \
+  --ir-file examples/program_graph/scale_sum.ll \
+  --out runs/debug/scale_sum.program_graph.json
+```
 
 ## ISA Split Policy
 
@@ -170,7 +241,7 @@ The first experiment should be explicit about the instruction distribution:
   `extension=RVV`
 
 AVX-512 VNNI is just one important test family, not the only x86 test target.
-The broader holdout tests whether the model can use micro-op semantics for
+The broader holdout tests whether the model can use Operation-graph semantics for
 newer dot-product, mixed-precision, matrix/tile, crypto, bit-manipulation, and
 other non-training operations rather than memorizing SSE/AVX names. RVV is a
 cross-ISA generalization test for vector lane, mask, and `vl` semantics.
@@ -181,34 +252,92 @@ The machine-readable policy lives in:
 config/instruction_semantic_splits.json
 ```
 
-## Dual-Graph Model
+When `scripts/build_iroptset_graph_dataset.py` receives
+`--instruction-graph-dir`, it filters the program train split to labels that
+exist in `train.instruction_graphs.jsonl`. This guarantees that RVV and
+non-SSE/AVX x86 extensions do not enter the training labels. Use
+`--max-train-examples-per-instruction` to greedily cap examples per train label
+so common instructions do not dominate the training split.
 
-The semantic path trains a dual-graph contrastive retriever:
+## Diff-Supervised Region Model
+
+The paper path trains on changed scalar regions extracted from before/after IR
+graph diffs, not on function-level bags. The model has a shared program-region
+encoder and two heads:
 
 ```text
-program encoder(preprocessed_ir computation graph) -> embedding
-instruction encoder(instruction micro-op semantic graph) -> embedding
-score = dot(program_embedding, instruction_embedding)
+program encoder(changed scalar region) -> region embedding
+changeability head(region embedding) -> should_change score
+instruction encoder(instruction Operation semantic graph) -> instruction embedding
+match score(region, instruction) = dot(region embedding, instruction embedding)
 ```
 
-Training loss is built only against `split=train` instruction graphs. Test-only
-instruction graphs such as RVV, AVX-512, AMX, and other non-SSE/AVX x86
-extensions are encoded only during evaluation. The default checkpoint selection
-split is `train`, so held-out extension scores are not used for model selection.
+Training positives come from scalar regions that disappear or are rewritten in
+the optimized/vectorized graph and are aligned to newly introduced intrinsic or
+vector operations. Training negatives come from candidate regions that remain
+unchanged under the same diff. At inference time, candidate regions are proposed
+from producer-consumer chains and loop/backedge slices; the model first scores
+whether a region should change, then ranks the instruction graphs for that
+region. Multiple-instance learning is intentionally not part of the main method.
+
+Use the LLVM vectorizer tests as the first clean training source:
 
 ```bash
-python3 scripts/train_instruction_dual_gnn.py \
-  --program-graph-dir runs/iroptset/graphs/pilot_10k_v1 \
-  --instruction-graph-dir runs/iroptset/instruction_graphs/pilot_10k_v1 \
-  --out-dir runs/iroptset/models/dual_gnn_pilot_10k_v1
+python3 scripts/build_llvm_vectorize_region_dataset.py \
+  --llvm-project-root /path/to/llvm-project \
+  --opt /path/to/llvm-project/build/bin/opt \
+  --out-dir runs/llvm_vectorize_regions/x86_v1
 ```
 
-Evaluate on the IR-OptSet validation/internal-test splits with:
+The collector reads `llvm/test/Transforms/LoopVectorize/X86` and
+`llvm/test/Transforms/SLPVectorizer/X86`, runs the corresponding vectorizer pass,
+and writes:
 
-- `Recall@10`
-- `Recall@20`
-- `Recall@50`
-- mean reciprocal rank for IR-used intrinsics
+```text
+runs/llvm_vectorize_regions/x86_v1/train.regions.jsonl
+runs/llvm_vectorize_regions/x86_v1/val.regions.jsonl
+runs/llvm_vectorize_regions/x86_v1/test.regions.jsonl
+runs/llvm_vectorize_regions/x86_v1/vector_instruction_specs.jsonl
+```
+
+Build instruction graphs for the observed vector labels:
+
+```bash
+python3 scripts/build_instruction_semantic_graphs.py \
+  --spec-jsonl runs/llvm_vectorize_regions/x86_v1/vector_instruction_specs.jsonl \
+  --out-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs
+```
+
+When the region labels include real `llvm.x86.*` intrinsics, include the
+imported Intel/Vegen intrinsic spec JSONL in the same `--spec-jsonl` invocation
+so those intrinsic labels can be matched during training.
+
+Then train the region model:
+
+```bash
+python3 scripts/train_region_intrinsic_model.py \
+  --region-dir runs/llvm_vectorize_regions/x86_v1 \
+  --instruction-graph-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs \
+  --out-dir runs/llvm_vectorize_regions/models/region_intrinsic_x86_v1
+```
+
+Ubuntu training servers can run the same commands from the repository root. The
+pipeline assumes only Python, PyTorch, and an LLVM `opt` binary:
+
+```bash
+python3 --version
+python3 -m pip install torch
+/path/to/llvm-project/build/bin/opt --version
+```
+
+Use the `opt` built from the same LLVM checkout that provides the test
+directories when possible. Collection failures are non-fatal per file and are
+summarized in `runs/llvm_vectorize_regions/x86_v1/summary.json`.
+
+Evaluate region detection and instruction matching with:
+
+- change-region accuracy, precision, and recall
+- `Recall@1`, `Recall@5`, and `Recall@10` over positive changed regions
 
 Then inject the top-k retrieved intrinsics into the Codex assembly prompt as an
 instruction palette and evaluate only on TSVC.
