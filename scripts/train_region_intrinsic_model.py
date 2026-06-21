@@ -307,6 +307,13 @@ def main() -> int:
     parser.add_argument("--selection-split", default="val")
     parser.add_argument("--device", default="auto")
     parser.add_argument("--seed", type=int, default=17)
+    parser.add_argument("--resume-from", type=Path)
+    parser.add_argument(
+        "--resume-extra-epochs",
+        type=int,
+        default=0,
+        help="When resuming, train this many additional epochs instead of treating --epochs as the final epoch.",
+    )
     args = parser.parse_args()
 
     torch, nn, F = require_torch()
@@ -316,6 +323,8 @@ def main() -> int:
         parser.error("--temperature must be positive")
     if args.match_loss_weight < 0.0:
         parser.error("--match-loss-weight must be non-negative")
+    if args.resume_extra_epochs < 0:
+        parser.error("--resume-extra-epochs must be non-negative")
     device = "cuda" if args.device == "auto" and torch.cuda.is_available() else args.device
     if device == "auto":
         device = "cpu"
@@ -378,6 +387,28 @@ def main() -> int:
         lr=args.lr,
         weight_decay=args.weight_decay,
     )
+    resume_epoch = 0
+    best_score = -math.inf
+    if args.resume_from is not None:
+        checkpoint = torch.load(args.resume_from, map_location=device)
+        region_encoder.load_state_dict(checkpoint["region_encoder_state"])
+        instruction_encoder.load_state_dict(checkpoint["instruction_encoder_state"])
+        change_head.load_state_dict(checkpoint["change_head_state"])
+        if "optimizer_state" in checkpoint:
+            optimizer.load_state_dict(checkpoint["optimizer_state"])
+        resume_epoch = int(checkpoint.get("epoch", 0))
+        best_score = float(checkpoint.get("best_score", checkpoint.get("score", -math.inf)))
+        print(
+            json.dumps(
+                {
+                    "resume_from": str(args.resume_from),
+                    "resume_epoch": resume_epoch,
+                    "loaded_optimizer_state": "optimizer_state" in checkpoint,
+                    "best_score": best_score,
+                },
+                sort_keys=True,
+            )
+        )
     change_criterion = nn.BCEWithLogitsLoss(
         pos_weight=change_positive_weight(torch, train_rows, args.max_pos_weight, device)
     )
@@ -385,13 +416,22 @@ def main() -> int:
         pos_weight=match_positive_weight(torch, train_rows, len(train_instruction_rows), args.max_pos_weight, device)
     )
     ks = [int(item) for item in args.eval_ks.split(",") if item.strip()]
+    final_epoch = args.epochs
+    if args.resume_from is not None and args.resume_extra_epochs > 0:
+        final_epoch = resume_epoch + args.resume_extra_epochs
+    start_epoch = resume_epoch + 1
+    if final_epoch < start_epoch:
+        raise SystemExit(
+            f"nothing to train: checkpoint epoch is {resume_epoch}, final epoch is {final_epoch}; "
+            "increase --epochs or pass --resume-extra-epochs"
+        )
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
     config = {
         "region_dir": str(args.region_dir),
         "instruction_graph_dir": str(args.instruction_graph_dir),
         "device": device,
-        "epochs": args.epochs,
+        "epochs": final_epoch,
         "batch_size": args.batch_size,
         "instruction_batch_size": args.instruction_batch_size,
         "hidden_dim": args.hidden_dim,
@@ -407,15 +447,41 @@ def main() -> int:
         "eval_ks": ks,
         "selection_split": args.selection_split,
         "seed": args.seed,
+        "resume_from": str(args.resume_from) if args.resume_from else None,
+        "resume_epoch": resume_epoch,
+        "resume_extra_epochs": args.resume_extra_epochs,
         "num_train_instruction_graphs": len(train_instruction_rows),
         "num_eval_instruction_graphs": len(instruction_rows_all),
     }
     (args.out_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
-    best_score = -math.inf
     best_path = args.out_dir / "best.pt"
+    last_path = args.out_dir / "last.pt"
+    history_path = args.out_dir / "history.json"
     history: list[dict[str, Any]] = []
-    for epoch in range(1, args.epochs + 1):
+    if args.resume_from is not None and history_path.exists():
+        try:
+            previous_history = json.loads(history_path.read_text(encoding="utf-8"))
+            if isinstance(previous_history, list):
+                history = [row for row in previous_history if int(row.get("epoch", 0)) < start_epoch]
+        except json.JSONDecodeError:
+            history = []
+
+    def checkpoint_payload(epoch: int, score: float) -> dict[str, Any]:
+        return {
+            "region_encoder_state": region_encoder.state_dict(),
+            "instruction_encoder_state": instruction_encoder.state_dict(),
+            "change_head_state": change_head.state_dict(),
+            "optimizer_state": optimizer.state_dict(),
+            "config": config,
+            "region_vocab": region_vocab,
+            "instruction_vocab": instruction_vocab,
+            "epoch": epoch,
+            "score": score,
+            "best_score": best_score,
+        }
+
+    for epoch in range(start_epoch, final_epoch + 1):
         train_metrics = train_epoch(
             torch,
             F,
@@ -455,21 +521,13 @@ def main() -> int:
         row = {"epoch": epoch, "train": train_metrics, **metrics}
         history.append(row)
         print(json.dumps(row, sort_keys=True))
-        if score > best_score:
+        is_best = score > best_score
+        if is_best:
             best_score = score
-            torch.save(
-                {
-                    "region_encoder_state": region_encoder.state_dict(),
-                    "instruction_encoder_state": instruction_encoder.state_dict(),
-                    "change_head_state": change_head.state_dict(),
-                    "config": config,
-                    "region_vocab": region_vocab,
-                    "instruction_vocab": instruction_vocab,
-                    "epoch": epoch,
-                    "score": best_score,
-                },
-                best_path,
-            )
+        payload = checkpoint_payload(epoch, score)
+        torch.save(payload, last_path)
+        if is_best:
+            torch.save(payload, best_path)
 
     final_metrics = {
         split: evaluate(
@@ -490,6 +548,7 @@ def main() -> int:
     }
     final_metrics["best_score"] = best_score
     final_metrics["best_checkpoint"] = str(best_path)
+    final_metrics["last_checkpoint"] = str(last_path)
     (args.out_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
     (args.out_dir / "metrics.json").write_text(json.dumps(final_metrics, indent=2), encoding="utf-8")
     print(json.dumps({"out_dir": str(args.out_dir), "metrics": final_metrics}, sort_keys=True))
