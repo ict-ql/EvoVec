@@ -86,6 +86,40 @@ VECTOR_OPS = {
     "fptoui",
 }
 
+LABEL_TYPE_RE = re.compile(r"^(?:v\d+(?:i\d+|f\d+)|i\d+|f\d+|p\d+)$")
+
+LLVM_FLOAT_TYPES = {
+    "f16": "half",
+    "f32": "float",
+    "f64": "double",
+    "f80": "x86_fp80",
+    "f128": "fp128",
+}
+
+BINARY_INTRINSIC_NAMES = {
+    "copysign",
+    "fshl",
+    "fshr",
+    "maxnum",
+    "maximum",
+    "minnum",
+    "minimum",
+    "pow",
+    "powi",
+}
+
+TERNARY_INTRINSIC_NAMES = {"fmuladd"}
+
+REDUCE_OP_SYMBOLS = {
+    "add": "+",
+    "fadd": "+",
+    "mul": "*",
+    "fmul": "*",
+    "and": "&",
+    "or": "|",
+    "xor": "^",
+}
+
 SCALAR_CHANGE_OPS = {
     "add",
     "fadd",
@@ -537,6 +571,146 @@ def vector_label_spec(label: str) -> dict[str, Any] | None:
     }
 
 
+def llvm_label_type_token(token: str) -> str:
+    vector_match = re.fullmatch(r"v(\d+)(i\d+|f\d+)", token)
+    if vector_match:
+        return f"v{vector_match.group(1)}x{llvm_label_type_token(vector_match.group(2))}"
+    if token in LLVM_FLOAT_TYPES:
+        return LLVM_FLOAT_TYPES[token]
+    if re.fullmatch(r"i\d+", token):
+        return token
+    if re.fullmatch(r"p\d+", token):
+        return "ptr"
+    return normalize_type_token(token)
+
+
+def llvm_label_type_parts(label: str) -> list[str]:
+    return [part for part in label.split(".") if LABEL_TYPE_RE.fullmatch(part)]
+
+
+def scalar_type_from_vector_type(data_type: str) -> str:
+    match = re.fullmatch(r"v\d+x(.+)", data_type)
+    return match.group(1) if match else data_type
+
+
+def llvm_label_base_name(label: str) -> str:
+    parts = label.split(".")[1:]
+    while parts and LABEL_TYPE_RE.fullmatch(parts[-1]):
+        parts.pop()
+    return ".".join(parts)
+
+
+def operation_function_name(name: str) -> str:
+    return re.sub(r"[^A-Za-z0-9_]+", "_", name).strip("_") or "llvm_intrinsic"
+
+
+def llvm_intrinsic_arity(base_name: str) -> int:
+    if "with.overflow" in base_name:
+        return 2
+    tail = base_name.split(".")[-1]
+    if tail in TERNARY_INTRINSIC_NAMES:
+        return 3
+    if tail in BINARY_INTRINSIC_NAMES:
+        return 2
+    if base_name.startswith("masked.store"):
+        return 3
+    if base_name.startswith("masked.load"):
+        return 2
+    return 1
+
+
+def reduction_label_spec(label: str) -> dict[str, Any] | None:
+    match = re.fullmatch(r"llvm\.vector\.reduce\.([a-z0-9_]+)\.(v\d+(?:i\d+|f\d+))", label)
+    if not match:
+        return None
+    opcode = match.group(1)
+    data_type = llvm_label_type_token(match.group(2))
+    lane_match = re.fullmatch(r"v(\d+)x(.+)", data_type)
+    if not lane_match:
+        return None
+    lanes = int(lane_match.group(1))
+    scalar_type = lane_match.group(2)
+    end = max(0, lanes - 1)
+    reduce_name = operation_function_name(f"reduce_{opcode}")
+    operands = [
+        {"name": "dst", "role": "dst", "type": scalar_type},
+        {"name": "a", "role": "src", "type": data_type},
+    ]
+    if opcode in REDUCE_OP_SYMBOLS:
+        symbol = REDUCE_OP_SYMBOLS[opcode]
+        operation = [
+            "acc := a[0]",
+            f"FOR lane := 1 to {end}",
+            f"acc := acc {symbol} a[lane]",
+            "ENDFOR",
+            "dst := acc",
+        ]
+    else:
+        operation = [
+            "acc := a[0]",
+            f"FOR lane := 1 to {end}",
+            f"acc := {reduce_name}(acc, a[lane])",
+            "ENDFOR",
+            "dst := acc",
+        ]
+    return {
+        "label": label,
+        "architecture": "llvm-ir",
+        "extension": "llvm-intrinsic",
+        "intrinsic": label,
+        "instruction": label.removeprefix("llvm."),
+        "cpuid": [],
+        "operands": operands,
+        "operation": operation,
+        "split": "train",
+        "source": "synthetic-llvm-intrinsic",
+    }
+
+
+def fallback_llvm_intrinsic_spec(label: str) -> dict[str, Any] | None:
+    if not label.startswith("llvm."):
+        return None
+    if spec := vector_label_spec(label):
+        return spec
+    if spec := reduction_label_spec(label):
+        return spec
+    type_parts = llvm_label_type_parts(label)
+    if not type_parts:
+        return None
+    data_type = llvm_label_type_token(next((part for part in type_parts if part.startswith("v")), type_parts[-1]))
+    base_name = llvm_label_base_name(label)
+    func_name = operation_function_name(base_name)
+    arity = llvm_intrinsic_arity(base_name)
+    source_type = data_type
+    indexed = re.fullmatch(r"v(\d+)x(.+)", data_type)
+    operands = [{"name": "dst", "role": "dst", "type": data_type}]
+    operands.extend({"name": chr(ord("a") + index), "role": "src", "type": source_type} for index in range(arity))
+    args = [chr(ord("a") + index) for index in range(arity)]
+    if indexed:
+        lanes = int(indexed.group(1))
+        end = max(0, lanes - 1)
+        indexed_args = ", ".join(f"{arg}[lane]" for arg in args)
+        operation = [
+            f"FOR lane := 0 to {end}",
+            f"dst[lane] := {func_name}({indexed_args})",
+            "ENDFOR",
+        ]
+    else:
+        operation = [f"dst := {func_name}({', '.join(args)})"]
+    return {
+        "label": label,
+        "architecture": "llvm-ir",
+        "extension": "llvm-intrinsic",
+        "intrinsic": label,
+        "instruction": label.removeprefix("llvm."),
+        "cpuid": [],
+        "operands": operands,
+        "operation": operation,
+        "split": "train",
+        "source": "synthetic-llvm-intrinsic",
+    }
+
+
 def make_region_record(
     symbolic: dict[str, Any],
     token_to_id: dict[str, int],
@@ -684,7 +858,7 @@ def main() -> int:
                 }
                 symbolic_rows.append((split, symbolic, metadata))
                 label_counter.update(target_labels)
-                vector_spec_labels.update(label for label in target_labels if label.startswith("llvm.vector."))
+                vector_spec_labels.update(label for label in target_labels if label.startswith("llvm."))
 
             stats["functions_with_regions"] += 1
             stats["positive_regions"] += positives
@@ -719,7 +893,7 @@ def main() -> int:
         rows = rows_by_split.get(split, [])
         write_jsonl(args.out_dir / f"{split}.regions.jsonl", rows)
 
-    vector_specs = [spec for label in sorted(vector_spec_labels) if (spec := vector_label_spec(label)) is not None]
+    vector_specs = [spec for label in sorted(vector_spec_labels) if (spec := fallback_llvm_intrinsic_spec(label)) is not None]
     if vector_specs:
         write_jsonl(args.out_dir / "vector_instruction_specs.jsonl", vector_specs)
 

@@ -463,6 +463,11 @@ def strip_comment(line: str) -> str:
 
 def instruction_opcode(text: str) -> str:
     rhs = text.split("=", 1)[1].strip() if "=" in text else text.strip()
+    if re.search(r"\b(?:call|invoke)\b", rhs):
+        callee_match = GLOBAL_RE.search(rhs)
+        if callee_match:
+            callee = normalize_token(callee_match.group(0).lstrip("@"))
+            return normalize_token(f"call_{callee}")
     tokens = [normalize_token(tok) for tok in TOKEN_RE.findall(rhs)]
     for token in tokens:
         if token in LLVM_PREFIXES:

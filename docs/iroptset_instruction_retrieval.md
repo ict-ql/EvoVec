@@ -300,7 +300,7 @@ runs/llvm_vectorize_regions/x86_v1/test.regions.jsonl
 runs/llvm_vectorize_regions/x86_v1/vector_instruction_specs.jsonl
 ```
 
-Build instruction graphs for the observed vector labels:
+Build instruction graphs for the observed vector and LLVM intrinsic labels:
 
 ```bash
 python3 scripts/build_instruction_semantic_graphs.py \
@@ -308,9 +308,11 @@ python3 scripts/build_instruction_semantic_graphs.py \
   --out-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs
 ```
 
-When the region labels include real `llvm.x86.*` intrinsics, include the
-imported Intel/Vegen intrinsic spec JSONL in the same `--spec-jsonl` invocation
-so those intrinsic labels can be matched during training.
+The generated synthetic specs cover generic vector ops, reductions, vector libm
+labels, and overflow/masked intrinsic labels. When the region labels include
+real `llvm.x86.*` intrinsics, include the imported Intel/Vegen intrinsic spec
+JSONL in the same `--spec-jsonl` invocation so those intrinsic labels can use
+real target-instruction semantics during training.
 
 Then train the region model:
 

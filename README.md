@@ -175,7 +175,7 @@ llvm/test/Transforms/SLPVectorizer/X86
 
 It runs `opt`, extracts changed scalar regions from before/after IR graph
 diffs, emits train/val/test `.regions.jsonl`, and writes synthetic instruction
-specs for observed vector IR operations:
+specs for observed vector IR operations and LLVM intrinsic labels:
 
 ```text
 runs/llvm_vectorize_regions/x86_v1/vector_instruction_specs.jsonl
@@ -189,9 +189,11 @@ python3 scripts/build_instruction_semantic_graphs.py \
   --out-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs
 ```
 
-If the collected labels include real `llvm.x86.*` intrinsics, pass the imported
+The synthetic specs cover generic LLVM vector ops, reductions, and common
+fallback intrinsic labels such as vector libm and overflow intrinsics. If the
+collected labels include real `llvm.x86.*` intrinsics, pass the imported
 Intel/Vegen intrinsic spec JSONL in the same `--spec-jsonl` list so those labels
-also have instruction graphs.
+use real target-instruction semantics instead of a generic fallback.
 
 Then train the changed-region detector plus intrinsic/vector-op matcher:
 
