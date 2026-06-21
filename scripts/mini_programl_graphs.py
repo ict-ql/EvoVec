@@ -826,7 +826,7 @@ def intrinsic_variable_node(
         node = symbol_nodes[normalized]
         merge_node_features(builder.node_features[node], features)
         return node
-    node = builder.add_node(normalized, "variable", {"full_text": name, **(features or {})})
+    node = builder.add_node(normalized, "variable", {"full_text": name, "symbol": normalized, **(features or {})})
     if node is not None:
         symbol_nodes[normalized] = node
     return node
@@ -1125,8 +1125,9 @@ def ensure_effect_node(
 ) -> int | None:
     if expr_node is not None and builder.node_types[expr_node] == "instruction":
         builder.node_features[expr_node].setdefault("full_text", full_text)
+        builder.node_features[expr_node].setdefault("effect", fallback_token)
         return expr_node
-    node = builder.add_node(fallback_token, "instruction", {"full_text": full_text})
+    node = builder.add_node(fallback_token, "instruction", {"full_text": full_text, "effect": fallback_token})
     builder.add_edge(expr_node, node, "data", 0, graph_edge_features("value", scope_stack))
     return node
 
@@ -1232,10 +1233,14 @@ def build_ast_stmt_graph(
         )
         add_scoped_control_edge(builder, previous_control, effect_node, scope_stack)
         lhs_node = add_ast_expr_graph(builder, symbol_nodes, constant_nodes, stmt.lhs, scope_stack)
+        if lhs_node is not None:
+            builder.node_features[lhs_node].setdefault("role", "def")
         add_data_edge(builder, effect_node, lhs_node, 0, "def", scope_stack)
         base = ast_lhs_base(stmt.lhs)
         if base is not None:
             base_node = intrinsic_variable_node(builder, symbol_nodes, base)
+            if base_node is not None:
+                builder.node_features[base_node].setdefault("role", "def")
             add_data_edge(builder, effect_node, base_node, 1, "def_base", scope_stack)
         return effect_node
 
