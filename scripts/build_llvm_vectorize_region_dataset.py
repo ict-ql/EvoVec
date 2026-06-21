@@ -86,7 +86,7 @@ VECTOR_OPS = {
     "fptoui",
 }
 
-LABEL_TYPE_RE = re.compile(r"^(?:v\d+(?:i\d+|f\d+)|i\d+|f\d+|p\d+)$")
+LABEL_TYPE_RE = re.compile(r"^(?:v\d+(?:i\d+|f\d+|p\d+)|i\d+|f\d+|p\d+)$")
 
 LLVM_FLOAT_TYPES = {
     "f16": "half",
@@ -572,7 +572,7 @@ def vector_label_spec(label: str) -> dict[str, Any] | None:
 
 
 def llvm_label_type_token(token: str) -> str:
-    vector_match = re.fullmatch(r"v(\d+)(i\d+|f\d+)", token)
+    vector_match = re.fullmatch(r"v(\d+)(i\d+|f\d+|p\d+)", token)
     if vector_match:
         return f"v{vector_match.group(1)}x{llvm_label_type_token(vector_match.group(2))}"
     if token in LLVM_FLOAT_TYPES:
@@ -615,6 +615,10 @@ def llvm_intrinsic_arity(base_name: str) -> int:
     if base_name.startswith("masked.store"):
         return 3
     if base_name.startswith("masked.load"):
+        return 2
+    if base_name.startswith("masked.scatter"):
+        return 3
+    if base_name.startswith("masked.gather"):
         return 2
     return 1
 
