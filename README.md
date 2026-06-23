@@ -183,10 +183,12 @@ runs/llvm_vectorize_regions/x86_v1/vector_instruction_specs.jsonl
 
 Region proposals are store-rooted by default: each store instruction seeds a
 backward data slice that pulls in the address/value computation feeding the
-write. Loop/backedge slices are also kept for loop-level regions. The older
-producer-consumer chain proposer is still available for debugging with
-`--candidate-modes producer-consumer`, but it is not the default because it cuts
-many vectorizable computations too finely.
+write. When the slice reaches a `phi`, the graph includes that `phi` node's
+control-flow predecessor edges, so loop backedges can appear inside the
+store-rooted region without creating a separate loop-level candidate. The older
+producer-consumer and whole loop/backedge proposers are still available for
+debugging or ablation, but they are not the default because they either cut
+computations too finely or make regions too coarse.
 
 Generic `llvm.vector.load.*` and `llvm.vector.store.*` labels are excluded from
 supervised targets by default. They remain as graph nodes inside regions and

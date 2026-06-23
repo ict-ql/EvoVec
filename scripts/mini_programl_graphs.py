@@ -88,6 +88,7 @@ TOKEN_RE = re.compile(r"[%@]?[A-Za-z_.$][A-Za-z0-9_.$-]*|[-+]?\d+(?:\.\d+)?")
 SSA_RE = re.compile(r"%[A-Za-z0-9_.$-]+")
 GLOBAL_RE = re.compile(r"@[A-Za-z0-9_.$-]+")
 LABEL_REF_RE = re.compile(r"\blabel\s+%([A-Za-z0-9_.$-]+)")
+PHI_INCOMING_RE = re.compile(r"\[\s*(?P<value>[^,\]]+?)\s*,\s*%(?P<block>[A-Za-z0-9_.$-]+)\s*\]")
 ASSIGN_RE = re.compile(r"(?P<lhs>.+?)(?::=|=)(?P<rhs>.+)")
 IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 NUMBER_RE = re.compile(r"[-+]?\d+")
@@ -567,6 +568,13 @@ def program_line_value_type(line: str) -> str | None:
     return first_llvm_type(rhs)
 
 
+def phi_incoming_blocks(line: str) -> set[str]:
+    rhs = line.split("=", 1)[1] if "=" in line else line
+    if not rhs.strip().startswith("phi "):
+        return set()
+    return {match.group("block") for match in PHI_INCOMING_RE.finditer(rhs)}
+
+
 def add_program_instruction(
     builder: MiniProgramlBuilder,
     line: str,
@@ -599,8 +607,10 @@ def add_program_instruction(
     add_type_annotation(builder, inst, line_data_type)
 
     operand_position = 0
+    phi_label_uses = {f"%{block}" for block in phi_incoming_blocks(line)}
+    branch_label_uses = {f"%{block}" for block in LABEL_REF_RE.findall(line)}
     for use in SSA_RE.findall(line):
-        if use == lhs:
+        if use == lhs or use in phi_label_uses or use in branch_label_uses:
             continue
         use_type = value_types.get(use, line_data_type)
         src = builder.defs.get(use)
@@ -644,6 +654,7 @@ def parse_program_ir_to_graph(
     block_order: dict[str, int] = {}
     block_first_inst: dict[str, int | None] = {}
     block_last_inst: dict[str, int | None] = {}
+    block_phi_insts: dict[str, list[int]] = {}
     for index, (block_name, _lines) in enumerate(blocks):
         block_order[block_name] = index
 
@@ -654,6 +665,8 @@ def parse_program_ir_to_graph(
             previous_inst = add_program_instruction(builder, line, block_name, block_order[block_name], previous_inst)
             if first_inst is None:
                 first_inst = previous_inst
+            if previous_inst is not None and instruction_opcode(line) == "phi":
+                block_phi_insts.setdefault(block_name, []).append(previous_inst)
         block_first_inst[block_name] = first_inst
         block_last_inst[block_name] = previous_inst
 
@@ -664,11 +677,25 @@ def parse_program_ir_to_graph(
         if terminator is None:
             continue
         for successor_position, target in enumerate(LABEL_REF_RE.findall(lines[-1])):
-            target_entry = block_first_inst.get(target)
-            if target_entry is None:
+            target_entries = block_phi_insts.get(target) or [block_first_inst.get(target)]
+            if not target_entries:
                 continue
             is_backedge = block_order.get(target, 10**9) <= block_order.get(block_name, -1)
-            builder.add_edge(terminator, target_entry, "control", successor_position, {"backedge": is_backedge})
+            for target_entry in target_entries:
+                if target_entry is None:
+                    continue
+                builder.add_edge(
+                    terminator,
+                    target_entry,
+                    "control",
+                    successor_position,
+                    {
+                        "backedge": is_backedge,
+                        "phi_control": bool(block_phi_insts.get(target)),
+                        "predecessor_block": block_name,
+                        "successor_block": target,
+                    },
+                )
 
     return builder.as_symbolic(
         "program",

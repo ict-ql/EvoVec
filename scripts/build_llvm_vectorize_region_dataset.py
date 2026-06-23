@@ -406,6 +406,24 @@ def add_adjacent_data_and_type_nodes(graph: dict[str, Any], selected: set[int]) 
     return expanded
 
 
+def add_phi_control_predecessors(graph: dict[str, Any], selected: set[int]) -> set[int]:
+    expanded = set(selected)
+    selected_phi_nodes = {
+        node
+        for node in selected
+        if graph["node_types"][node] == "instruction" and graph["node_tokens"][node] == "phi"
+    }
+    if not selected_phi_nodes:
+        return expanded
+    for src, dst, edge_type, _position in graph["edges"]:
+        src = int(src)
+        dst = int(dst)
+        if edge_type == "control" and dst in selected_phi_nodes:
+            expanded.add(src)
+            expanded.add(dst)
+    return expanded
+
+
 def subgraph_symbolic(graph: dict[str, Any], selected_nodes: set[int]) -> dict[str, Any]:
     ordered = sorted(selected_nodes)
     remap = {old: new for new, old in enumerate(ordered)}
@@ -505,6 +523,7 @@ def store_backward_candidates(
                     break
             if max_nodes > 0 and len(selected) > max_nodes:
                 break
+        selected = add_phi_control_predecessors(graph, selected)
         expanded = add_adjacent_data_and_type_nodes(graph, selected)
         if max_nodes > 0 and len(expanded) > max_nodes:
             continue
@@ -560,7 +579,7 @@ def candidate_regions(
     store_slice_depth: int = 5,
     store_slice_max_nodes: int = 128,
 ) -> list[set[int]]:
-    selected_modes = modes or ("store_backward", "loop_backedge")
+    selected_modes = modes or ("store_backward",)
     candidates: list[set[int]] = []
     if "store_backward" in selected_modes:
         candidates.extend(
@@ -891,7 +910,7 @@ def main() -> int:
     parser.add_argument("--max-negatives-per-function", type=int, default=8)
     parser.add_argument(
         "--candidate-modes",
-        default="store-backward,loop-backedge",
+        default="store-backward",
         help="Comma-separated region proposal modes: store-backward, loop-backedge, producer-consumer.",
     )
     parser.add_argument("--store-slice-depth", type=int, default=5)

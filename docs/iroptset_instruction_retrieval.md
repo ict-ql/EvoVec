@@ -276,12 +276,13 @@ Training positives come from scalar regions that disappear or are rewritten in
 the optimized/vectorized graph and are aligned to newly introduced intrinsic or
 vector operations. Training negatives come from candidate regions that remain
 unchanged under the same diff. At inference time, candidate regions are proposed
-from store-rooted backward slices plus loop/backedge slices; the model first
-scores whether a region should change, then ranks the instruction graphs for
-that region. The older producer-consumer chain proposer is retained only for
-debugging or ablation because it often cuts vectorizable computations too
-finely. Multiple-instance learning is intentionally not part of the main
-method.
+from store-rooted backward slices; when such a slice reaches a `phi`, the graph
+also includes the `phi` node's control-flow predecessor edges, including
+backedges. The model first scores whether a region should change, then ranks the
+instruction graphs for that region. The older producer-consumer and whole
+loop/backedge proposers are retained only for debugging or ablation because they
+often cut vectorizable computations too finely or make regions too coarse.
+Multiple-instance learning is intentionally not part of the main method.
 
 Generic vector memory labels, such as `llvm.vector.load.*` and
 `llvm.vector.store.*`, are graph-internal operations rather than useful

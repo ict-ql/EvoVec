@@ -297,7 +297,7 @@ def main() -> int:
     parser.add_argument("--only-predicted-change", action="store_true")
     parser.add_argument(
         "--candidate-modes",
-        default="store-backward,loop-backedge",
+        default="store-backward",
         help="Comma-separated region proposal modes: store-backward, loop-backedge, producer-consumer.",
     )
     parser.add_argument("--store-slice-depth", type=int, default=5)
