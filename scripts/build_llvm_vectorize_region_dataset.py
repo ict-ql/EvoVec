@@ -175,6 +175,10 @@ BINARY_VECTOR_OP_SYMBOLS = {
     "ashr": ">>",
 }
 
+DEFAULT_EXCLUDE_TARGET_LABEL_REGEXES = (
+    r"^llvm\.vector\.(?:load|store)\.",
+)
+
 
 def stable_hash(text: str) -> str:
     return hashlib.sha1(text.encode("utf-8")).hexdigest()
@@ -337,6 +341,21 @@ def collect_after_labels(
     return labels
 
 
+def compile_label_regexes(patterns: list[str] | tuple[str, ...]) -> list[re.Pattern[str]]:
+    return [re.compile(pattern) for pattern in patterns if pattern]
+
+
+def filter_label_counter(labels: Counter[str], exclude_regexes: list[re.Pattern[str]]) -> Counter[str]:
+    if not exclude_regexes:
+        return Counter(labels)
+    filtered: Counter[str] = Counter()
+    for label, count in labels.items():
+        if any(pattern.search(label) for pattern in exclude_regexes):
+            continue
+        filtered[label] = count
+    return filtered
+
+
 def graph_instruction_indices(graph: dict[str, Any]) -> list[int]:
     return [index for index, node_type in enumerate(graph["node_types"]) if node_type == "instruction"]
 
@@ -438,6 +457,61 @@ def producer_consumer_candidates(graph: dict[str, Any]) -> list[set[int]]:
     return candidates
 
 
+def store_backward_candidates(
+    graph: dict[str, Any],
+    max_depth: int = 5,
+    max_nodes: int = 128,
+) -> list[set[int]]:
+    defs_by_value: dict[int, list[int]] = defaultdict(list)
+    incoming_data_by_instruction: dict[int, list[int]] = defaultdict(list)
+    for edge_index, (src, dst, edge_type, _position) in enumerate(graph["edges"]):
+        if edge_type != "data":
+            continue
+        features = graph["edge_features"][edge_index]
+        role = features.get("role")
+        src = int(src)
+        dst = int(dst)
+        if role == "def" and graph["node_types"][src] == "instruction":
+            defs_by_value[dst].append(src)
+        elif graph["node_types"][dst] == "instruction":
+            incoming_data_by_instruction[dst].append(src)
+
+    store_nodes = [
+        index
+        for index, token in enumerate(graph["node_tokens"])
+        if graph["node_types"][index] == "instruction" and token == "store"
+    ]
+    candidates: list[set[int]] = []
+    for store in store_nodes:
+        selected: set[int] = {store}
+        frontier: list[tuple[int, int]] = [(store, 0)]
+        seen_instructions: set[int] = {store}
+        while frontier:
+            instruction, depth = frontier.pop(0)
+            if depth >= max_depth:
+                continue
+            for operand in incoming_data_by_instruction.get(instruction, []):
+                selected.add(operand)
+                if max_nodes > 0 and len(selected) > max_nodes:
+                    break
+                for producer in defs_by_value.get(operand, []):
+                    selected.add(producer)
+                    if producer not in seen_instructions:
+                        seen_instructions.add(producer)
+                        frontier.append((producer, depth + 1))
+                    if max_nodes > 0 and len(selected) > max_nodes:
+                        break
+                if max_nodes > 0 and len(selected) > max_nodes:
+                    break
+            if max_nodes > 0 and len(selected) > max_nodes:
+                break
+        expanded = add_adjacent_data_and_type_nodes(graph, selected)
+        if max_nodes > 0 and len(expanded) > max_nodes:
+            continue
+        candidates.append(expanded)
+    return candidates
+
+
 def loop_backedge_candidates(graph: dict[str, Any]) -> list[set[int]]:
     candidates: list[set[int]] = []
     for edge_index, (src, dst, edge_type, _position) in enumerate(graph["edges"]):
@@ -460,8 +534,46 @@ def loop_backedge_candidates(graph: dict[str, Any]) -> list[set[int]]:
     return candidates
 
 
-def candidate_regions(graph: dict[str, Any]) -> list[set[int]]:
-    candidates = [*producer_consumer_candidates(graph), *loop_backedge_candidates(graph)]
+def parse_candidate_modes(text: str) -> tuple[str, ...]:
+    aliases = {
+        "producer-consumer": "producer_consumer",
+        "producer_consumer": "producer_consumer",
+        "store-backward": "store_backward",
+        "store_backward": "store_backward",
+        "loop-backedge": "loop_backedge",
+        "loop_backedge": "loop_backedge",
+    }
+    modes: list[str] = []
+    for item in text.split(","):
+        key = item.strip().lower()
+        if not key:
+            continue
+        if key not in aliases:
+            raise ValueError(f"unknown candidate mode: {item}")
+        modes.append(aliases[key])
+    return tuple(dict.fromkeys(modes))
+
+
+def candidate_regions(
+    graph: dict[str, Any],
+    modes: tuple[str, ...] | None = None,
+    store_slice_depth: int = 5,
+    store_slice_max_nodes: int = 128,
+) -> list[set[int]]:
+    selected_modes = modes or ("store_backward", "loop_backedge")
+    candidates: list[set[int]] = []
+    if "store_backward" in selected_modes:
+        candidates.extend(
+            store_backward_candidates(
+                graph,
+                max_depth=store_slice_depth,
+                max_nodes=store_slice_max_nodes,
+            )
+        )
+    if "producer_consumer" in selected_modes:
+        candidates.extend(producer_consumer_candidates(graph))
+    if "loop_backedge" in selected_modes:
+        candidates.extend(loop_backedge_candidates(graph))
     deduped: list[set[int]] = []
     seen: set[tuple[int, ...]] = set()
     for selected in candidates:
@@ -762,10 +874,28 @@ def main() -> int:
     parser.add_argument("--label-source", choices=["intrinsic", "vector-op", "both"], default="both")
     parser.add_argument("--include-intrinsic-prefix", action="append")
     parser.add_argument("--exclude-intrinsic-prefix", action="append")
+    parser.add_argument(
+        "--keep-memory-target-labels",
+        action="store_true",
+        help="Keep generic llvm.vector.load/store labels as supervised targets.",
+    )
+    parser.add_argument(
+        "--exclude-target-label-regex",
+        action="append",
+        default=[],
+        help="Additional regex for labels to remove from supervised target labels.",
+    )
     parser.add_argument("--max-token-vocab", type=int, default=20000)
     parser.add_argument("--min-token-count", type=int, default=1)
     parser.add_argument("--min-positive-overlap", type=int, default=1)
     parser.add_argument("--max-negatives-per-function", type=int, default=8)
+    parser.add_argument(
+        "--candidate-modes",
+        default="store-backward,loop-backedge",
+        help="Comma-separated region proposal modes: store-backward, loop-backedge, producer-consumer.",
+    )
+    parser.add_argument("--store-slice-depth", type=int, default=5)
+    parser.add_argument("--store-slice-max-nodes", type=int, default=128)
     parser.add_argument("--limit", type=int, default=0)
     parser.add_argument("--drop-symbols", action="store_true")
     parser.add_argument("--include-debug-text", action="store_true")
@@ -781,6 +911,15 @@ def main() -> int:
     exclude_intrinsic_prefixes = tuple(
         dict.fromkeys((*DEFAULT_EXCLUDE_INTRINSIC_PREFIXES, *split_prefixes(args.exclude_intrinsic_prefix)))
     )
+    try:
+        candidate_modes = parse_candidate_modes(args.candidate_modes)
+    except ValueError as exc:
+        raise SystemExit(str(exc)) from exc
+    exclude_target_patterns = [
+        *(() if args.keep_memory_target_labels else DEFAULT_EXCLUDE_TARGET_LABEL_REGEXES),
+        *args.exclude_target_label_regex,
+    ]
+    exclude_target_regexes = compile_label_regexes(exclude_target_patterns)
 
     symbolic_rows: list[tuple[str, dict[str, Any], dict[str, Any]]] = []
     failures: list[dict[str, Any]] = []
@@ -807,15 +946,19 @@ def main() -> int:
         for function_name in common_names:
             before_fn = before_functions[function_name]
             after_fn = after_functions[function_name]
-            labels = collect_after_labels(
+            raw_labels = collect_after_labels(
                 after_fn,
                 args.label_source,
                 include_intrinsic_prefixes,
                 exclude_intrinsic_prefixes,
             )
-            if not labels:
+            if not raw_labels:
                 stats["no_after_labels"] += 1
                 continue
+            labels = filter_label_counter(raw_labels, exclude_target_regexes)
+            stats["raw_after_label_occurrences"] += sum(raw_labels.values())
+            stats["target_label_occurrences"] += sum(labels.values())
+            stats["excluded_target_label_occurrences"] += sum(raw_labels.values()) - sum(labels.values())
             try:
                 before_graph = parse_program_ir_to_graph(before_fn)
             except Exception as exc:  # pragma: no cover - defensive for unusual LLVM IR tests
@@ -824,7 +967,12 @@ def main() -> int:
                 continue
 
             changed_nodes = changed_instruction_nodes(before_graph, after_fn)
-            candidates = candidate_regions(before_graph)
+            candidates = candidate_regions(
+                before_graph,
+                modes=candidate_modes,
+                store_slice_depth=args.store_slice_depth,
+                store_slice_max_nodes=args.store_slice_max_nodes,
+            )
             if not candidates:
                 stats["no_candidates"] += 1
                 continue
@@ -854,6 +1002,7 @@ def main() -> int:
                     "change_label": change_label,
                     "target_labels": target_labels,
                     "target_label_counts": {label: int(labels[label]) for label in target_labels},
+                    "raw_target_label_counts": {label: int(raw_labels[label]) for label in sorted(raw_labels)},
                     "changed_instruction_overlap": overlap_count,
                     "changed_instruction_total": len(changed_nodes),
                     "source_node_count": len(selected),
@@ -911,6 +1060,10 @@ def main() -> int:
             "graph_schema": "mini-programl",
             "graph_kind": "changed_region",
             "label_source": args.label_source,
+            "exclude_target_label_regexes": exclude_target_patterns,
+            "candidate_modes": list(candidate_modes),
+            "store_slice_depth": args.store_slice_depth,
+            "store_slice_max_nodes": args.store_slice_max_nodes,
             "min_positive_overlap": args.min_positive_overlap,
             "max_negatives_per_function": args.max_negatives_per_function,
         },

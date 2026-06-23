@@ -1260,9 +1260,16 @@ def parse_intrinsic_spec_to_graph(
     max_nodes: int = 0,
     max_edges: int = 0,
     max_operand_nodes: int = 0,
+    root_token_mode: str = "generic",
 ) -> dict[str, Any]:
     builder = MiniProgramlBuilder(max_nodes=max_nodes, max_edges=max_edges, max_operand_nodes=max_operand_nodes)
     label = instruction_label(record)
+    if root_token_mode == "label":
+        root_token = label
+    elif root_token_mode == "generic":
+        root_token = "intrinsic_root"
+    else:
+        raise ValueError(f"unknown intrinsic root token mode: {root_token_mode}")
     graph_features = {
         "label": label,
         "architecture": first_text(record, "architecture", "isa"),
@@ -1273,7 +1280,7 @@ def parse_intrinsic_spec_to_graph(
         "source": first_text(record, "source"),
     }
     root = builder.add_node(
-        label,
+        root_token,
         "instruction",
         {"full_text": first_text(record, "instruction", "assembly", "intrinsic", "label"), "semantic_root": True},
     )
@@ -1303,11 +1310,12 @@ def parse_mini_programl(
     max_nodes: int = 512,
     max_edges: int = 4096,
     max_operand_nodes: int = 128,
+    root_token_mode: str = "generic",
 ) -> dict[str, Any]:
     if mode == "program":
         return parse_program_ir_to_graph(str(source), max_nodes, max_edges, max_operand_nodes)
     if mode == "intrinsic":
         if not isinstance(source, dict):
             raise TypeError("intrinsic mode expects a spec record dictionary")
-        return parse_intrinsic_spec_to_graph(source, max_nodes, max_edges, max_operand_nodes)
+        return parse_intrinsic_spec_to_graph(source, max_nodes, max_edges, max_operand_nodes, root_token_mode)
     raise ValueError(f"unknown mini-programl parse mode: {mode}")

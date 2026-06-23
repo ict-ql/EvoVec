@@ -5,12 +5,14 @@ import argparse
 from collections import Counter
 import json
 from pathlib import Path
+import re
 from typing import Any
 
 try:
     from build_llvm_vectorize_region_dataset import (
         candidate_regions,
         extract_defined_functions,
+        parse_candidate_modes,
         stable_hash,
         subgraph_symbolic,
     )
@@ -25,6 +27,7 @@ except ModuleNotFoundError:  # pragma: no cover - used when imported as a packag
     from scripts.build_llvm_vectorize_region_dataset import (
         candidate_regions,
         extract_defined_functions,
+        parse_candidate_modes,
         stable_hash,
         subgraph_symbolic,
     )
@@ -90,6 +93,9 @@ def build_regions_for_ir(
     token_to_id: dict[str, int],
     include_symbols: bool,
     max_regions_per_function: int,
+    candidate_modes: tuple[str, ...],
+    store_slice_depth: int,
+    store_slice_max_nodes: int,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     failures: list[dict[str, Any]] = []
     rows: list[dict[str, Any]] = []
@@ -100,7 +106,12 @@ def build_regions_for_ir(
     for function_name, function_ir in functions.items():
         try:
             graph = parse_program_ir_to_graph(function_ir)
-            candidates = candidate_regions(graph)
+            candidates = candidate_regions(
+                graph,
+                modes=candidate_modes,
+                store_slice_depth=store_slice_depth,
+                store_slice_max_nodes=store_slice_max_nodes,
+            )
         except Exception as exc:  # noqa: BLE001 - report and continue per input file
             failures.append(
                 {
@@ -162,6 +173,20 @@ def recommendation_entry(row: dict[str, Any], score: float, rank: int) -> dict[s
         "extension": row.get("extension"),
         "architecture": row.get("architecture"),
     }
+
+
+DEFAULT_EXCLUDE_RECOMMENDATION_LABEL_REGEXES = (
+    r"^llvm\.vector\.(?:load|store)\.",
+)
+
+
+def compile_label_regexes(patterns: list[str] | tuple[str, ...]) -> list[re.Pattern[str]]:
+    return [re.compile(pattern) for pattern in patterns if pattern]
+
+
+def keep_recommendation_label(row: dict[str, Any], exclude_regexes: list[re.Pattern[str]]) -> bool:
+    label = str(row.get("label", ""))
+    return not any(pattern.search(label) for pattern in exclude_regexes)
 
 
 def predict(
@@ -257,8 +282,26 @@ def main() -> int:
     parser.add_argument("--out-jsonl", type=Path, default=Path("runs/llvm_vectorize_regions/recommendations.jsonl"))
     parser.add_argument("--out-md", type=Path)
     parser.add_argument("--top-k", type=int, default=10)
+    parser.add_argument(
+        "--include-memory-labels",
+        action="store_true",
+        help="Include generic llvm.vector.load/store labels in recommendation ranking.",
+    )
+    parser.add_argument(
+        "--exclude-label-regex",
+        action="append",
+        default=[],
+        help="Additional regex for labels to hide from recommendation ranking.",
+    )
     parser.add_argument("--change-threshold", type=float, default=0.0)
     parser.add_argument("--only-predicted-change", action="store_true")
+    parser.add_argument(
+        "--candidate-modes",
+        default="store-backward,loop-backedge",
+        help="Comma-separated region proposal modes: store-backward, loop-backedge, producer-consumer.",
+    )
+    parser.add_argument("--store-slice-depth", type=int, default=5)
+    parser.add_argument("--store-slice-max-nodes", type=int, default=128)
     parser.add_argument("--max-regions-per-function", type=int, default=0)
     parser.add_argument("--max-report-regions", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=64)
@@ -271,6 +314,10 @@ def main() -> int:
         parser.error("pass at least one --ir-file or --ir-dir")
     if args.top_k <= 0:
         parser.error("--top-k must be positive")
+    try:
+        candidate_modes = parse_candidate_modes(args.candidate_modes)
+    except ValueError as exc:
+        parser.error(str(exc))
 
     torch, nn, F = require_torch()
     device = "cuda" if args.device == "auto" and torch.cuda.is_available() else args.device
@@ -287,6 +334,16 @@ def main() -> int:
     instruction_rows = load_instruction_graphs(args.instruction_graph_dir)
     if not instruction_rows:
         raise SystemExit(f"no instruction graphs found in {args.instruction_graph_dir}")
+    exclude_label_patterns = [
+        *(() if args.include_memory_labels else DEFAULT_EXCLUDE_RECOMMENDATION_LABEL_REGEXES),
+        *args.exclude_label_regex,
+    ]
+    exclude_label_regexes = compile_label_regexes(exclude_label_patterns)
+    ranking_instruction_rows = [
+        row for row in instruction_rows if keep_recommendation_label(row, exclude_label_regexes)
+    ]
+    if not ranking_instruction_rows:
+        raise SystemExit("no instruction graphs remain after recommendation label filtering")
 
     region_encoder = make_encoder(torch, nn, F, region_vocab, config, device)
     instruction_encoder = make_encoder(torch, nn, F, instruction_vocab, config, device)
@@ -307,6 +364,9 @@ def main() -> int:
             region_vocab["token_to_id"],
             include_symbols=not args.drop_symbols,
             max_regions_per_function=args.max_regions_per_function,
+            candidate_modes=candidate_modes,
+            store_slice_depth=args.store_slice_depth,
+            store_slice_max_nodes=args.store_slice_max_nodes,
         )
         regions.extend(file_regions)
         failures.extend(file_failures)
@@ -318,7 +378,7 @@ def main() -> int:
         instruction_encoder,
         change_head,
         regions,
-        instruction_rows,
+        ranking_instruction_rows,
         args.batch_size,
         args.instruction_batch_size,
         args.top_k,
@@ -342,6 +402,11 @@ def main() -> int:
         "regions": len(regions),
         "written_regions": len(recommendations),
         "instruction_graphs": len(instruction_rows),
+        "ranked_instruction_graphs": len(ranking_instruction_rows),
+        "excluded_recommendation_label_regexes": exclude_label_patterns,
+        "candidate_modes": list(candidate_modes),
+        "store_slice_depth": args.store_slice_depth,
+        "store_slice_max_nodes": args.store_slice_max_nodes,
         "checkpoint": str(args.checkpoint),
         "out_jsonl": str(args.out_jsonl),
         "out_md": str(args.out_md) if args.out_md else None,

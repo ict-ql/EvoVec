@@ -181,6 +181,19 @@ specs for observed vector IR operations and LLVM intrinsic labels:
 runs/llvm_vectorize_regions/x86_v1/vector_instruction_specs.jsonl
 ```
 
+Region proposals are store-rooted by default: each store instruction seeds a
+backward data slice that pulls in the address/value computation feeding the
+write. Loop/backedge slices are also kept for loop-level regions. The older
+producer-consumer chain proposer is still available for debugging with
+`--candidate-modes producer-consumer`, but it is not the default because it cuts
+many vectorizable computations too finely.
+
+Generic `llvm.vector.load.*` and `llvm.vector.store.*` labels are excluded from
+supervised targets by default. They remain as graph nodes inside regions and
+instruction micro-operation graphs, but they are not useful top-level
+recommendations. Pass `--keep-memory-target-labels` only for debugging the
+closed-set vectorizer behavior.
+
 Build instruction graphs for those observed labels:
 
 ```bash
@@ -189,11 +202,28 @@ python3 scripts/build_instruction_semantic_graphs.py \
   --out-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs
 ```
 
+To add zero-shot target instructions, such as AMX, pass their micro-operation
+specs as candidate specs:
+
+```bash
+python3 scripts/build_instruction_semantic_graphs.py \
+  --spec-jsonl runs/llvm_vectorize_regions/x86_v1/vector_instruction_specs.jsonl \
+  --candidate-spec-jsonl runs/instruction_semantics/amx_instruction_specs.jsonl \
+  --out-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs
+```
+
 The synthetic specs cover generic LLVM vector ops, reductions, and common
 fallback intrinsic labels such as vector libm and overflow intrinsics. If the
 collected labels include real `llvm.x86.*` intrinsics, pass the imported
 Intel/Vegen intrinsic spec JSONL in the same `--spec-jsonl` list so those labels
 use real target-instruction semantics instead of a generic fallback.
+
+The semantic retrieval path uses generic instruction root tokens by default. It
+prevents the instruction label itself, such as `llvm.vector.add.v4xi32` or an
+AMX intrinsic name, from becoming a trainable node token. The label remains in
+metadata, while the GNN sees the operation graph. This is important for
+zero-shot candidate instructions whose labels never appear as training targets.
+Use `--root-token-mode label` only for closed-set debugging.
 
 Then train the changed-region detector plus intrinsic/vector-op matcher:
 
@@ -225,7 +255,9 @@ python3 scripts/recommend_region_intrinsics.py \
 
 The output is inference-only: each candidate region gets a change probability
 and a ranked list of intrinsic/vector labels. It does not require after-IR or
-diff labels.
+diff labels. Generic vector load/store labels are hidden from the ranking by
+default; pass `--include-memory-labels` only when inspecting raw closed-set
+behavior.
 
 On Ubuntu, run these commands from the repository root. The scripts are portable
 Python and do not require Windows paths or PowerShell, but the server must have:

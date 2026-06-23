@@ -276,9 +276,18 @@ Training positives come from scalar regions that disappear or are rewritten in
 the optimized/vectorized graph and are aligned to newly introduced intrinsic or
 vector operations. Training negatives come from candidate regions that remain
 unchanged under the same diff. At inference time, candidate regions are proposed
-from producer-consumer chains and loop/backedge slices; the model first scores
-whether a region should change, then ranks the instruction graphs for that
-region. Multiple-instance learning is intentionally not part of the main method.
+from store-rooted backward slices plus loop/backedge slices; the model first
+scores whether a region should change, then ranks the instruction graphs for
+that region. The older producer-consumer chain proposer is retained only for
+debugging or ablation because it often cuts vectorizable computations too
+finely. Multiple-instance learning is intentionally not part of the main
+method.
+
+Generic vector memory labels, such as `llvm.vector.load.*` and
+`llvm.vector.store.*`, are graph-internal operations rather than useful
+top-level recommendations. They are excluded from supervised target labels and
+from inference rankings by default, while load/store nodes remain inside the
+region and instruction graphs.
 
 Use the LLVM vectorizer tests as the first clean training source:
 
@@ -308,11 +317,28 @@ python3 scripts/build_instruction_semantic_graphs.py \
   --out-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs
 ```
 
+Add unsupported or weakly supported target instructions as zero-shot candidates:
+
+```bash
+python3 scripts/build_instruction_semantic_graphs.py \
+  --spec-jsonl runs/llvm_vectorize_regions/x86_v1/vector_instruction_specs.jsonl \
+  --candidate-spec-jsonl runs/instruction_semantics/amx_instruction_specs.jsonl \
+  --out-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs
+```
+
 The generated synthetic specs cover generic vector ops, reductions, vector libm
 labels, and overflow/masked intrinsic labels. When the region labels include
 real `llvm.x86.*` intrinsics, include the imported Intel/Vegen intrinsic spec
 JSONL in the same `--spec-jsonl` invocation so those intrinsic labels can use
 real target-instruction semantics during training.
+
+For zero-shot instruction retrieval, including unsupported or weakly supported
+target intrinsics such as AMX, instruction graph root tokens are generic by
+default. The instruction name stays in metadata only; the encoder matches the
+program region against the micro-operation graph. Records passed through
+`--candidate-spec-jsonl` are forced to split `candidate`, so they contribute
+vocabulary and inference candidates without being treated as negative labels
+during supervised training.
 
 Then train the region model:
 

@@ -136,6 +136,13 @@ def main() -> int:
         description="Build mini-ProGraML instruction graphs from intrinsic/instruction Operation specs."
     )
     parser.add_argument("--spec-jsonl", type=Path, nargs="+", required=True)
+    parser.add_argument(
+        "--candidate-spec-jsonl",
+        type=Path,
+        nargs="*",
+        default=[],
+        help="Additional zero-shot candidate instruction specs; records are forced to split=candidate.",
+    )
     parser.add_argument("--out-dir", type=Path, default=Path("runs/instruction_semantics/sample"))
     parser.add_argument("--split-policy", type=Path)
     parser.add_argument("--max-token-vocab", type=int, default=20000)
@@ -143,6 +150,12 @@ def main() -> int:
     parser.add_argument("--max-nodes", type=int, default=512)
     parser.add_argument("--max-edges", type=int, default=4096)
     parser.add_argument("--max-operand-nodes", type=int, default=256)
+    parser.add_argument(
+        "--root-token-mode",
+        choices=["label", "generic"],
+        default="generic",
+        help="Default generic prevents instruction label leakage for zero-shot semantic retrieval; use label only for closed-set debugging.",
+    )
     parser.add_argument("--drop-symbols", action="store_true", help="Do not store node tokens/types in graph rows.")
     parser.add_argument("--include-debug-text", action="store_true", help="Keep debug-only full_text fields in symbolic output.")
     args = parser.parse_args()
@@ -150,6 +163,13 @@ def main() -> int:
     records: list[dict[str, Any]] = []
     for path in args.spec_jsonl:
         records.extend(load_jsonl(path))
+    candidate_records = 0
+    for path in args.candidate_spec_jsonl:
+        for record in load_jsonl(path):
+            candidate = dict(record)
+            candidate["split"] = "candidate"
+            records.append(candidate)
+            candidate_records += 1
     if not records:
         raise SystemExit("no instruction specs found")
     split_policy = load_split_policy(args.split_policy)
@@ -162,6 +182,7 @@ def main() -> int:
             max_nodes=args.max_nodes,
             max_edges=args.max_edges,
             max_operand_nodes=args.max_operand_nodes,
+            root_token_mode=args.root_token_mode,
         )
         symbolic_rows.append((record, symbolic))
         token_counter.update(symbolic["node_tokens"])
@@ -181,6 +202,7 @@ def main() -> int:
             "max_nodes": args.max_nodes,
             "max_edges": args.max_edges,
             "max_operand_nodes": args.max_operand_nodes,
+            "root_token_mode": args.root_token_mode,
         },
     }
     (args.out_dir / "vocab.json").write_text(json.dumps(vocab, indent=2), encoding="utf-8")
@@ -214,6 +236,9 @@ def main() -> int:
     summary["token_vocab_size"] = len(token_to_id)
     if args.split_policy:
         summary["split_policy"] = str(args.split_policy)
+    if args.candidate_spec_jsonl:
+        summary["candidate_spec_jsonl"] = [str(path) for path in args.candidate_spec_jsonl]
+        summary["candidate_records"] = candidate_records
     summary["node_type_to_id"] = NODE_TYPES
     summary["edge_type_to_id"] = EDGE_TYPES
     summary["edge_feature_to_id"] = EDGE_FEATURE_TYPES
