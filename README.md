@@ -204,6 +204,29 @@ python3 scripts/train_region_intrinsic_model.py \
   --out-dir runs/llvm_vectorize_regions/models/region_intrinsic_x86_v1
 ```
 
+To inspect recommendations on pre-vectorization TSVC IR, first emit scalar IR
+with LLVM vectorizers disabled, then run the retriever:
+
+```bash
+clang -S -emit-llvm -O3 -fno-vectorize -fno-slp-vectorize \
+  -I runs/tsvc_kernels/v1/support \
+  runs/tsvc_kernels/v1/kernels/s000/reference_kernel.c \
+  -o runs/tsvc_prevec_ir/s000.ll
+
+python3 scripts/recommend_region_intrinsics.py \
+  --ir-file runs/tsvc_prevec_ir/s000.ll \
+  --checkpoint runs/llvm_vectorize_regions/models/region_intrinsic_x86_v1/best.pt \
+  --instruction-graph-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs \
+  --out-jsonl runs/llvm_vectorize_regions/recommendations/s000.jsonl \
+  --out-md runs/llvm_vectorize_regions/recommendations/s000.md \
+  --top-k 10 \
+  --device cuda
+```
+
+The output is inference-only: each candidate region gets a change probability
+and a ranked list of intrinsic/vector labels. It does not require after-IR or
+diff labels.
+
 On Ubuntu, run these commands from the repository root. The scripts are portable
 Python and do not require Windows paths or PowerShell, but the server must have:
 
