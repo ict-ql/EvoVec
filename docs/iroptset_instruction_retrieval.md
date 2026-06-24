@@ -320,12 +320,15 @@ python3 scripts/build_instruction_semantic_graphs.py \
 
 Do not add unsupported or weakly supported target instructions, such as AMX, to
 the training instruction graph directory. Keep training on observed vectorizer
-labels only. Candidate specs can be parsed separately for inspection:
+labels only. For inference, build a separate instruction graph directory that
+contains the observed labels plus AMX candidates:
 
 ```bash
 python3 scripts/build_instruction_semantic_graphs.py \
-  --spec-jsonl examples/instruction_semantics/amx_instruction_specs.jsonl \
-  --out-dir runs/instruction_semantics/amx_check
+  --spec-jsonl \
+    runs/llvm_vectorize_regions/x86_v1/vector_instruction_specs.jsonl \
+    examples/instruction_semantics/amx_instruction_specs.jsonl \
+  --out-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs_with_amx
 ```
 
 The generated synthetic specs cover generic vector ops, reductions, vector libm
@@ -337,11 +340,12 @@ real target-instruction semantics during training.
 For zero-shot instruction retrieval, including unsupported or weakly supported
 target intrinsics such as AMX, instruction graph root tokens are generic by
 default. The instruction name stays in metadata only; the encoder matches the
-program region against the micro-operation graph. At inference,
-`recommend_region_intrinsics.py --candidate-spec-jsonl ...` parses those specs
-and encodes them with the checkpoint's existing instruction vocabulary. Tokens
-never seen during training fall back to `<unk>`, which keeps AMX out of training
-while still making AMX graph candidates rankable.
+program region against the micro-operation graph. At inference, point
+`recommend_region_intrinsics.py --instruction-graph-dir` at the directory that
+contains AMX. The recommender re-encodes those instruction rows with the
+checkpoint's existing instruction vocabulary, so AMX can appear in the
+candidate set without appearing in training. Tokens never seen during training
+fall back to `<unk>`.
 
 Then train the region model:
 

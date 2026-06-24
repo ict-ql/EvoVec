@@ -16,15 +16,7 @@ try:
         stable_hash,
         subgraph_symbolic,
     )
-    from mini_programl_graphs import (
-        encode_graph,
-        first_text,
-        instruction_label,
-        load_jsonl,
-        parse_intrinsic_spec_to_graph,
-        parse_program_ir_to_graph,
-        record_aliases,
-    )
+    from mini_programl_graphs import encode_graph, parse_program_ir_to_graph
     from train_instruction_dual_gnn import RelationalGraphEncoder, batch_graphs, encode_all
     from train_region_intrinsic_model import (
         load_instruction_graphs,
@@ -39,15 +31,7 @@ except ModuleNotFoundError:  # pragma: no cover - used when imported as a packag
         stable_hash,
         subgraph_symbolic,
     )
-    from scripts.mini_programl_graphs import (
-        encode_graph,
-        first_text,
-        instruction_label,
-        load_jsonl,
-        parse_intrinsic_spec_to_graph,
-        parse_program_ir_to_graph,
-        record_aliases,
-    )
+    from scripts.mini_programl_graphs import encode_graph, parse_program_ir_to_graph
     from scripts.train_instruction_dual_gnn import RelationalGraphEncoder, batch_graphs, encode_all
     from scripts.train_region_intrinsic_model import (
         load_instruction_graphs,
@@ -230,53 +214,6 @@ def reencode_instruction_rows(
     return output
 
 
-def make_instruction_record(
-    record: dict[str, Any],
-    symbolic: dict[str, Any],
-    token_to_id: dict[str, int],
-    split: str,
-) -> dict[str, Any]:
-    encoded = encode_graph(symbolic, token_to_id)
-    return {
-        "label": instruction_label(record),
-        "split": split,
-        "architecture": first_text(record, "architecture", "isa"),
-        "extension": first_text(record, "extension", "instruction_set"),
-        "intrinsic": first_text(record, "llvm_intrinsic", "intrinsic"),
-        "instruction": first_text(record, "instruction", "assembly"),
-        "aliases": record_aliases(record),
-        "graph_schema": symbolic.get("graph_schema", "mini-programl"),
-        "graph_kind": symbolic.get("graph_kind", "intrinsic"),
-        "num_nodes": len(encoded["node_token_ids"]),
-        "num_edges": len(encoded["edges"]),
-        "node_token_ids": encoded["node_token_ids"],
-        "node_type_ids": encoded["node_type_ids"],
-        "edges": encoded["edges"],
-        "edge_feature_ids": encoded["edge_feature_ids"],
-        "edge_counts": encoded["edge_counts"],
-        "node_tokens": symbolic["node_tokens"],
-        "node_types": symbolic["node_types"],
-        "node_features": symbolic["node_features"],
-        "symbolic_edges": symbolic["edges"],
-        "edge_features": symbolic["edge_features"],
-        "graph_features": symbolic["graph_features"],
-    }
-
-
-def load_candidate_instruction_specs(
-    paths: list[Path],
-    token_to_id: dict[str, int],
-) -> list[dict[str, Any]]:
-    candidates: list[dict[str, Any]] = []
-    for path in paths:
-        for record in load_jsonl(path):
-            candidate = dict(record)
-            candidate["split"] = "candidate"
-            symbolic = parse_intrinsic_spec_to_graph(candidate, root_token_mode="generic")
-            candidates.append(make_instruction_record(candidate, symbolic, token_to_id, "candidate"))
-    return candidates
-
-
 def make_encoder(torch, nn, F, vocab: dict[str, Any], config: dict[str, Any], device: str):
     return RelationalGraphEncoder(
         torch,
@@ -410,16 +347,6 @@ def main() -> int:
     parser.add_argument("--glob", default="*.ll")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--instruction-graph-dir", type=Path, required=True)
-    parser.add_argument(
-        "--candidate-spec-jsonl",
-        type=Path,
-        nargs="*",
-        default=[],
-        help=(
-            "Additional zero-shot candidate instruction specs to append at inference time. "
-            "They are encoded with the checkpoint instruction vocabulary and are not part of training."
-        ),
-    )
     parser.add_argument("--out-jsonl", type=Path, default=Path("runs/llvm_vectorize_regions/recommendations.jsonl"))
     parser.add_argument("--out-md", type=Path)
     parser.add_argument("--top-k", type=int, default=10)
@@ -476,6 +403,7 @@ def main() -> int:
     if not instruction_rows:
         raise SystemExit(f"no instruction graphs found in {args.instruction_graph_dir}")
     graph_instruction_vocab = load_instruction_vocab(args.instruction_graph_dir)
+    instruction_vocab_mismatch_keys = instruction_vocab_mismatches(instruction_vocab, graph_instruction_vocab)
     instruction_rows = reencode_instruction_rows(
         instruction_rows,
         instruction_vocab,
@@ -483,11 +411,6 @@ def main() -> int:
         args.instruction_graph_dir,
         args.checkpoint,
     )
-    candidate_instruction_rows = load_candidate_instruction_specs(
-        args.candidate_spec_jsonl,
-        instruction_vocab["token_to_id"],
-    )
-    instruction_rows.extend(candidate_instruction_rows)
     exclude_label_patterns = [
         *(() if args.include_memory_labels else DEFAULT_EXCLUDE_RECOMMENDATION_LABEL_REGEXES),
         *args.exclude_label_regex,
@@ -556,8 +479,8 @@ def main() -> int:
         "regions": len(regions),
         "written_regions": len(recommendations),
         "instruction_graphs": len(instruction_rows),
-        "candidate_spec_graphs": len(candidate_instruction_rows),
-        "candidate_spec_jsonl": [str(path) for path in args.candidate_spec_jsonl],
+        "instruction_graph_vocab_mismatches": instruction_vocab_mismatch_keys,
+        "instruction_graph_reencoded_with_checkpoint_vocab": bool(instruction_vocab_mismatch_keys),
         "ranked_instruction_graphs": len(ranking_instruction_rows),
         "excluded_recommendation_label_regexes": exclude_label_patterns,
         "candidate_modes": list(candidate_modes),
