@@ -287,12 +287,13 @@ instruction vocabulary. That lets the inference directory contain AMX even
 though the checkpoint was trained without AMX; tokens never seen during training
 fall back to `<unk>`.
 
-To continue training in small chunks and run the GEMM AMX probe automatically
-after each chunk:
+To train in small chunks and run the GEMM AMX probe automatically after each
+chunk, use a fresh `MODEL_DIR` to rerun from scratch, or an existing `MODEL_DIR`
+to resume from `last.pt`:
 
 ```bash
 REGION_DIR=runs/llvm_vectorize_regions/x86_store_phi_nomem_v3
-MODEL_DIR=runs/llvm_vectorize_regions/models/region_intrinsic_x86_store_phi_nomem_v3
+MODEL_DIR=runs/llvm_vectorize_regions/models/region_intrinsic_x86_store_phi_nomem_v3_amx_probe
 
 python3 scripts/resume_train_gemm_amx_probe.py \
   --region-dir "$REGION_DIR" \
@@ -306,11 +307,23 @@ python3 scripts/resume_train_gemm_amx_probe.py \
   --snapshot-on-target
 ```
 
-The script writes per-round recommendation files plus:
+If `MODEL_DIR` has no `last.pt`, round 1 trains from scratch for
+`--epochs-per-round`; later rounds resume for another chunk. If you want to reuse
+the hyperparameters from an earlier run while writing to a fresh `MODEL_DIR`,
+pass that run's config:
+
+```bash
+  --train-config runs/llvm_vectorize_regions/models/region_intrinsic_x86_store_phi_nomem_v3/config.json
+```
+
+The script writes per-round recommendation files and keeps the checkpoint with
+the best AMX probe rank:
 
 ```text
 runs/gemm_recommendations/amx_training_probe/probe_history.jsonl
 runs/gemm_recommendations/amx_training_probe/probe_history.md
+runs/gemm_recommendations/amx_training_probe/best_amx_probe.pt
+runs/gemm_recommendations/amx_training_probe/best_amx_probe.json
 ```
 
 The output is inference-only: each candidate region gets a change probability

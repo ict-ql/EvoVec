@@ -56,6 +56,12 @@ def read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def training_config(args: argparse.Namespace) -> dict[str, Any]:
+    if args.train_config is not None:
+        return read_json(args.train_config)
+    return read_json(args.model_dir / "config.json")
+
+
 def instruction_labels(graph_dir: Path) -> list[str]:
     labels: list[str] = []
     for path in sorted(graph_dir.glob("*.instruction_graphs.jsonl")):
@@ -137,9 +143,7 @@ def latest_epoch(model_dir: Path) -> int | None:
 
 def train_one_round(args: argparse.Namespace, root: Path, round_index: int) -> None:
     checkpoint = args.model_dir / "last.pt"
-    if not checkpoint.exists():
-        raise SystemExit(f"missing resume checkpoint: {checkpoint}")
-    config = read_json(args.model_dir / "config.json")
+    config = training_config(args)
     cmd = [
         sys.executable,
         "scripts/train_region_intrinsic_model.py",
@@ -149,15 +153,24 @@ def train_one_round(args: argparse.Namespace, root: Path, round_index: int) -> N
         str(args.train_instruction_graph_dir),
         "--out-dir",
         str(args.model_dir),
-        "--resume-from",
-        str(checkpoint),
-        "--resume-extra-epochs",
-        str(args.epochs_per_round),
         "--device",
         args.device,
     ]
+    if checkpoint.exists():
+        cmd.extend(
+            [
+                "--resume-from",
+                str(checkpoint),
+                "--resume-extra-epochs",
+                str(args.epochs_per_round),
+            ]
+        )
+        mode = f"+{args.epochs_per_round} epochs"
+    else:
+        cmd.extend(["--epochs", str(args.epochs_per_round)])
+        mode = f"fresh {args.epochs_per_round} epochs"
     append_config_args(cmd, config)
-    print(f"\n=== train round {round_index}: +{args.epochs_per_round} epochs ===", flush=True)
+    print(f"\n=== train round {round_index}: {mode} ===", flush=True)
     run_command(cmd, root)
 
 
@@ -199,6 +212,40 @@ def summarize_recommendations(path: Path, pattern: re.Pattern[str]) -> dict[str,
         "best_target_hit": best_hit,
         "top1_label_counts": top1_counts.most_common(10),
     }
+
+
+def is_better_target_probe(candidate: dict[str, Any], best: dict[str, Any] | None) -> bool:
+    candidate_hit = candidate.get("best_target_hit")
+    if not candidate_hit:
+        return False
+    if best is None or not best.get("best_target_hit"):
+        return True
+    best_hit = best["best_target_hit"]
+    candidate_key = (
+        int(candidate_hit.get("rank", 1_000_000)),
+        -int(candidate.get("target_hit_regions", 0)),
+        -float(candidate_hit.get("score", 0.0)),
+        -float(candidate_hit.get("change_probability", 0.0)),
+    )
+    best_key = (
+        int(best_hit.get("rank", 1_000_000)),
+        -int(best.get("target_hit_regions", 0)),
+        -float(best_hit.get("score", 0.0)),
+        -float(best_hit.get("change_probability", 0.0)),
+    )
+    return candidate_key < best_key
+
+
+def save_best_target_checkpoint(args: argparse.Namespace, summary: dict[str, Any]) -> None:
+    checkpoint = Path(str(summary["checkpoint"]))
+    if not checkpoint.exists():
+        return
+    out_checkpoint = args.probe_out_dir / "best_amx_probe.pt"
+    out_summary = args.probe_out_dir / "best_amx_probe.json"
+    shutil.copy2(checkpoint, out_checkpoint)
+    best_summary = dict(summary)
+    best_summary["best_amx_probe_checkpoint"] = str(out_checkpoint)
+    out_summary.write_text(json.dumps(best_summary, indent=2, sort_keys=True), encoding="utf-8")
 
 
 def run_probe(args: argparse.Namespace, root: Path, gemm_ir: Path, round_index: int) -> dict[str, Any]:
@@ -293,11 +340,19 @@ def load_existing_probe_history(path: Path) -> list[dict[str, Any]]:
     return load_jsonl(path)
 
 
+def best_probe_from_history(history: list[dict[str, Any]]) -> dict[str, Any] | None:
+    best: dict[str, Any] | None = None
+    for row in history:
+        if is_better_target_probe(row, best):
+            best = row
+    return best
+
+
 def main() -> int:
     root = repo_root()
     parser = argparse.ArgumentParser(
         description=(
-            "Resume region-intrinsic training in chunks and run a GEMM AMX "
+            "Train or resume region-intrinsic training in chunks and run a GEMM AMX "
             "zero-shot recommendation probe after each chunk."
         )
     )
@@ -305,6 +360,15 @@ def main() -> int:
     parser.add_argument("--train-instruction-graph-dir", type=Path, required=True)
     parser.add_argument("--probe-instruction-graph-dir", type=Path, required=True)
     parser.add_argument("--model-dir", type=Path, required=True)
+    parser.add_argument(
+        "--train-config",
+        type=Path,
+        help=(
+            "Optional config.json to reuse hyperparameters from an earlier run. "
+            "If omitted, an existing model-dir/config.json is used when present; "
+            "otherwise train_region_intrinsic_model.py defaults are used."
+        ),
+    )
     parser.add_argument("--rounds", type=int, default=6)
     parser.add_argument("--epochs-per-round", type=int, default=5)
     parser.add_argument("--device", default="cuda")
@@ -336,6 +400,8 @@ def main() -> int:
         path = getattr(args, attr)
         if not path.is_absolute():
             setattr(args, attr, root / path)
+    if args.train_config is not None and not args.train_config.is_absolute():
+        args.train_config = root / args.train_config
     if not args.probe_out_dir.is_absolute():
         args.probe_out_dir = root / args.probe_out_dir
     args.probe_out_dir.mkdir(parents=True, exist_ok=True)
@@ -368,11 +434,18 @@ def main() -> int:
     gemm_ir = compile_gemm_ir(args, root)
     history_path = args.probe_out_dir / "probe_history.jsonl"
     history = load_existing_probe_history(history_path)
+    best_probe = best_probe_from_history(history)
     start_round = len(history) + 1
     for offset in range(args.rounds):
         round_index = start_round + offset
         train_one_round(args, root, round_index)
         summary = run_probe(args, root, gemm_ir, round_index)
+        if is_better_target_probe(summary, best_probe):
+            save_best_target_checkpoint(args, summary)
+            summary["best_amx_probe_updated"] = True
+            best_probe = summary
+        else:
+            summary["best_amx_probe_updated"] = False
         history.append(summary)
         write_jsonl(history_path, history)
         write_history_markdown(args.probe_out_dir / "probe_history.md", history)
