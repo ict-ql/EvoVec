@@ -204,14 +204,15 @@ python3 scripts/build_instruction_semantic_graphs.py \
   --out-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs
 ```
 
-To add zero-shot target instructions, such as AMX, pass their micro-operation
-specs as candidate specs:
+Do not include zero-shot target instructions, such as AMX, in the training
+instruction graph directory. Keep training on observed vectorizer labels only;
+AMX is injected later at inference time from its micro-operation spec. To inspect
+the AMX graph by itself, you can build it as a candidate graph:
 
 ```bash
 python3 scripts/build_instruction_semantic_graphs.py \
-  --spec-jsonl runs/llvm_vectorize_regions/x86_v1/vector_instruction_specs.jsonl \
-  --candidate-spec-jsonl runs/instruction_semantics/amx_instruction_specs.jsonl \
-  --out-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs
+  --spec-jsonl examples/instruction_semantics/amx_instruction_specs.jsonl \
+  --out-dir runs/instruction_semantics/amx_check
 ```
 
 The synthetic specs cover generic LLVM vector ops, reductions, and common
@@ -254,6 +255,37 @@ python3 scripts/recommend_region_intrinsics.py \
   --top-k 10 \
   --device cuda
 ```
+
+For a quick AMX smoke test, emit scalar GEMM IR and append AMX only at
+inference time. The checkpoint and `--instruction-graph-dir` stay the original
+no-AMX training artifacts:
+
+```bash
+mkdir -p runs/gemm_prevec_ir runs/gemm_recommendations
+
+clang -S -emit-llvm -O2 -fno-vectorize -fno-slp-vectorize -fno-unroll-loops \
+  examples/gemm/gemm_scalar.c \
+  -o runs/gemm_prevec_ir/gemm_scalar.ll
+
+python3 scripts/recommend_region_intrinsics.py \
+  --ir-file runs/gemm_prevec_ir/gemm_scalar.ll \
+  --checkpoint runs/llvm_vectorize_regions/models/region_intrinsic_x86_v1/best.pt \
+  --instruction-graph-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs \
+  --candidate-spec-jsonl examples/instruction_semantics/amx_instruction_specs.jsonl \
+  --out-jsonl runs/gemm_recommendations/gemm_amx.jsonl \
+  --out-md runs/gemm_recommendations/gemm_amx.md \
+  --top-k 20 \
+  --store-slice-depth 8 \
+  --store-slice-max-nodes 256 \
+  --device cuda
+
+grep -Ein "amx|tdpb|tile" runs/gemm_recommendations/gemm_amx.md
+```
+
+Candidate specs passed to the recommender are parsed and encoded with the
+checkpoint's existing instruction vocabulary. Tokens never seen during training
+fall back to `<unk>`, so this tests whether the trained semantic encoder can
+rank AMX from the micro-operation graph rather than from AMX labels in training.
 
 The output is inference-only: each candidate region gets a change probability
 and a ranked list of intrinsic/vector labels. It does not require after-IR or

@@ -318,13 +318,14 @@ python3 scripts/build_instruction_semantic_graphs.py \
   --out-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs
 ```
 
-Add unsupported or weakly supported target instructions as zero-shot candidates:
+Do not add unsupported or weakly supported target instructions, such as AMX, to
+the training instruction graph directory. Keep training on observed vectorizer
+labels only. Candidate specs can be parsed separately for inspection:
 
 ```bash
 python3 scripts/build_instruction_semantic_graphs.py \
-  --spec-jsonl runs/llvm_vectorize_regions/x86_v1/vector_instruction_specs.jsonl \
-  --candidate-spec-jsonl runs/instruction_semantics/amx_instruction_specs.jsonl \
-  --out-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs
+  --spec-jsonl examples/instruction_semantics/amx_instruction_specs.jsonl \
+  --out-dir runs/instruction_semantics/amx_check
 ```
 
 The generated synthetic specs cover generic vector ops, reductions, vector libm
@@ -336,10 +337,11 @@ real target-instruction semantics during training.
 For zero-shot instruction retrieval, including unsupported or weakly supported
 target intrinsics such as AMX, instruction graph root tokens are generic by
 default. The instruction name stays in metadata only; the encoder matches the
-program region against the micro-operation graph. Records passed through
-`--candidate-spec-jsonl` are forced to split `candidate`, so they contribute
-vocabulary and inference candidates without being treated as negative labels
-during supervised training.
+program region against the micro-operation graph. At inference,
+`recommend_region_intrinsics.py --candidate-spec-jsonl ...` parses those specs
+and encodes them with the checkpoint's existing instruction vocabulary. Tokens
+never seen during training fall back to `<unk>`, which keeps AMX out of training
+while still making AMX graph candidates rankable.
 
 Then train the region model:
 

@@ -16,7 +16,15 @@ try:
         stable_hash,
         subgraph_symbolic,
     )
-    from mini_programl_graphs import encode_graph, parse_program_ir_to_graph
+    from mini_programl_graphs import (
+        encode_graph,
+        first_text,
+        instruction_label,
+        load_jsonl,
+        parse_intrinsic_spec_to_graph,
+        parse_program_ir_to_graph,
+        record_aliases,
+    )
     from train_instruction_dual_gnn import RelationalGraphEncoder, batch_graphs, encode_all
     from train_region_intrinsic_model import (
         load_instruction_graphs,
@@ -31,7 +39,15 @@ except ModuleNotFoundError:  # pragma: no cover - used when imported as a packag
         stable_hash,
         subgraph_symbolic,
     )
-    from scripts.mini_programl_graphs import encode_graph, parse_program_ir_to_graph
+    from scripts.mini_programl_graphs import (
+        encode_graph,
+        first_text,
+        instruction_label,
+        load_jsonl,
+        parse_intrinsic_spec_to_graph,
+        parse_program_ir_to_graph,
+        record_aliases,
+    )
     from scripts.train_instruction_dual_gnn import RelationalGraphEncoder, batch_graphs, encode_all
     from scripts.train_region_intrinsic_model import (
         load_instruction_graphs,
@@ -144,6 +160,121 @@ def load_checkpoint(torch, checkpoint_path: Path, device: str) -> dict[str, Any]
         if key not in checkpoint:
             raise SystemExit(f"checkpoint is missing {key}: {checkpoint_path}")
     return checkpoint
+
+
+def load_instruction_vocab(instruction_graph_dir: Path) -> dict[str, Any] | None:
+    vocab_path = instruction_graph_dir / "vocab.json"
+    if not vocab_path.exists():
+        return None
+    return json.loads(vocab_path.read_text(encoding="utf-8"))
+
+
+def instruction_vocab_mismatches(checkpoint_vocab: dict[str, Any], graph_vocab: dict[str, Any] | None) -> list[str]:
+    if graph_vocab is None:
+        return ["missing_vocab_json"]
+    keys = ("token_to_id", "node_type_to_id", "edge_type_to_id", "edge_feature_to_id")
+    return [key for key in keys if checkpoint_vocab.get(key) != graph_vocab.get(key)]
+
+
+def has_symbolic_instruction_graph(row: dict[str, Any]) -> bool:
+    return all(key in row for key in ("node_tokens", "node_types", "symbolic_edges", "edge_features"))
+
+
+def reencode_symbolic_instruction_row(row: dict[str, Any], token_to_id: dict[str, int]) -> dict[str, Any]:
+    symbolic = {
+        "node_tokens": row["node_tokens"],
+        "node_types": row["node_types"],
+        "edges": row["symbolic_edges"],
+        "edge_features": row["edge_features"],
+    }
+    encoded = encode_graph(symbolic, token_to_id)
+    output = dict(row)
+    output.update(
+        {
+            "node_token_ids": encoded["node_token_ids"],
+            "node_type_ids": encoded["node_type_ids"],
+            "edges": encoded["edges"],
+            "edge_feature_ids": encoded["edge_feature_ids"],
+            "edge_counts": encoded["edge_counts"],
+        }
+    )
+    return output
+
+
+def reencode_instruction_rows(
+    rows: list[dict[str, Any]],
+    checkpoint_vocab: dict[str, Any],
+    graph_vocab: dict[str, Any] | None,
+    instruction_graph_dir: Path,
+    checkpoint_path: Path,
+) -> list[dict[str, Any]]:
+    mismatched = instruction_vocab_mismatches(checkpoint_vocab, graph_vocab)
+    token_to_id = checkpoint_vocab["token_to_id"]
+    output: list[dict[str, Any]] = []
+    missing_symbolic = 0
+    for row in rows:
+        if has_symbolic_instruction_graph(row):
+            output.append(reencode_symbolic_instruction_row(row, token_to_id))
+        else:
+            missing_symbolic += 1
+            output.append(row)
+    if mismatched and missing_symbolic:
+        joined = ", ".join(mismatched)
+        raise SystemExit(
+            "instruction graph vocab does not match checkpoint and some graph rows "
+            "lack symbolic node/edge fields needed for re-encoding "
+            f"({joined}). Rebuild the instruction graphs without --drop-symbols, "
+            f"or use the original training graph directory. checkpoint={checkpoint_path} "
+            f"instruction_graph_dir={instruction_graph_dir}"
+        )
+    return output
+
+
+def make_instruction_record(
+    record: dict[str, Any],
+    symbolic: dict[str, Any],
+    token_to_id: dict[str, int],
+    split: str,
+) -> dict[str, Any]:
+    encoded = encode_graph(symbolic, token_to_id)
+    return {
+        "label": instruction_label(record),
+        "split": split,
+        "architecture": first_text(record, "architecture", "isa"),
+        "extension": first_text(record, "extension", "instruction_set"),
+        "intrinsic": first_text(record, "llvm_intrinsic", "intrinsic"),
+        "instruction": first_text(record, "instruction", "assembly"),
+        "aliases": record_aliases(record),
+        "graph_schema": symbolic.get("graph_schema", "mini-programl"),
+        "graph_kind": symbolic.get("graph_kind", "intrinsic"),
+        "num_nodes": len(encoded["node_token_ids"]),
+        "num_edges": len(encoded["edges"]),
+        "node_token_ids": encoded["node_token_ids"],
+        "node_type_ids": encoded["node_type_ids"],
+        "edges": encoded["edges"],
+        "edge_feature_ids": encoded["edge_feature_ids"],
+        "edge_counts": encoded["edge_counts"],
+        "node_tokens": symbolic["node_tokens"],
+        "node_types": symbolic["node_types"],
+        "node_features": symbolic["node_features"],
+        "symbolic_edges": symbolic["edges"],
+        "edge_features": symbolic["edge_features"],
+        "graph_features": symbolic["graph_features"],
+    }
+
+
+def load_candidate_instruction_specs(
+    paths: list[Path],
+    token_to_id: dict[str, int],
+) -> list[dict[str, Any]]:
+    candidates: list[dict[str, Any]] = []
+    for path in paths:
+        for record in load_jsonl(path):
+            candidate = dict(record)
+            candidate["split"] = "candidate"
+            symbolic = parse_intrinsic_spec_to_graph(candidate, root_token_mode="generic")
+            candidates.append(make_instruction_record(candidate, symbolic, token_to_id, "candidate"))
+    return candidates
 
 
 def make_encoder(torch, nn, F, vocab: dict[str, Any], config: dict[str, Any], device: str):
@@ -279,6 +410,16 @@ def main() -> int:
     parser.add_argument("--glob", default="*.ll")
     parser.add_argument("--checkpoint", type=Path, required=True)
     parser.add_argument("--instruction-graph-dir", type=Path, required=True)
+    parser.add_argument(
+        "--candidate-spec-jsonl",
+        type=Path,
+        nargs="*",
+        default=[],
+        help=(
+            "Additional zero-shot candidate instruction specs to append at inference time. "
+            "They are encoded with the checkpoint instruction vocabulary and are not part of training."
+        ),
+    )
     parser.add_argument("--out-jsonl", type=Path, default=Path("runs/llvm_vectorize_regions/recommendations.jsonl"))
     parser.add_argument("--out-md", type=Path)
     parser.add_argument("--top-k", type=int, default=10)
@@ -334,6 +475,19 @@ def main() -> int:
     instruction_rows = load_instruction_graphs(args.instruction_graph_dir)
     if not instruction_rows:
         raise SystemExit(f"no instruction graphs found in {args.instruction_graph_dir}")
+    graph_instruction_vocab = load_instruction_vocab(args.instruction_graph_dir)
+    instruction_rows = reencode_instruction_rows(
+        instruction_rows,
+        instruction_vocab,
+        graph_instruction_vocab,
+        args.instruction_graph_dir,
+        args.checkpoint,
+    )
+    candidate_instruction_rows = load_candidate_instruction_specs(
+        args.candidate_spec_jsonl,
+        instruction_vocab["token_to_id"],
+    )
+    instruction_rows.extend(candidate_instruction_rows)
     exclude_label_patterns = [
         *(() if args.include_memory_labels else DEFAULT_EXCLUDE_RECOMMENDATION_LABEL_REGEXES),
         *args.exclude_label_regex,
@@ -402,6 +556,8 @@ def main() -> int:
         "regions": len(regions),
         "written_regions": len(recommendations),
         "instruction_graphs": len(instruction_rows),
+        "candidate_spec_graphs": len(candidate_instruction_rows),
+        "candidate_spec_jsonl": [str(path) for path in args.candidate_spec_jsonl],
         "ranked_instruction_graphs": len(ranking_instruction_rows),
         "excluded_recommendation_label_regexes": exclude_label_patterns,
         "candidate_modes": list(candidate_modes),
