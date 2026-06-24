@@ -287,6 +287,32 @@ instruction vocabulary. That lets the inference directory contain AMX even
 though the checkpoint was trained without AMX; tokens never seen during training
 fall back to `<unk>`.
 
+To continue training in small chunks and run the GEMM AMX probe automatically
+after each chunk:
+
+```bash
+REGION_DIR=runs/llvm_vectorize_regions/x86_store_phi_nomem_v3
+MODEL_DIR=runs/llvm_vectorize_regions/models/region_intrinsic_x86_store_phi_nomem_v3
+
+python3 scripts/resume_train_gemm_amx_probe.py \
+  --region-dir "$REGION_DIR" \
+  --train-instruction-graph-dir "$REGION_DIR/instruction_graphs" \
+  --probe-instruction-graph-dir "$REGION_DIR/instruction_graphs_with_amx" \
+  --model-dir "$MODEL_DIR" \
+  --rounds 6 \
+  --epochs-per-round 5 \
+  --probe-out-dir runs/gemm_recommendations/amx_training_probe \
+  --device cuda \
+  --snapshot-on-target
+```
+
+The script writes per-round recommendation files plus:
+
+```text
+runs/gemm_recommendations/amx_training_probe/probe_history.jsonl
+runs/gemm_recommendations/amx_training_probe/probe_history.md
+```
+
 The output is inference-only: each candidate region gets a change probability
 and a ranked list of intrinsic/vector labels. It does not require after-IR or
 diff labels. Generic vector load/store labels are hidden from the ranking by
