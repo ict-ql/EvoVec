@@ -287,43 +287,53 @@ instruction vocabulary. That lets the inference directory contain AMX even
 though the checkpoint was trained without AMX; tokens never seen during training
 fall back to `<unk>`.
 
-To train in small chunks and run the GEMM AMX probe automatically after each
-chunk, use a fresh `MODEL_DIR` to rerun from scratch, or an existing `MODEL_DIR`
-to resume from `last.pt`:
+To train continuously while checking the GEMM AMX zero-shot probe every few
+epochs, use the training graph directory without AMX and the probe graph
+directory with AMX:
 
 ```bash
 REGION_DIR=runs/llvm_vectorize_regions/x86_store_phi_nomem_v3
 MODEL_DIR=runs/llvm_vectorize_regions/models/region_intrinsic_x86_store_phi_nomem_v3_amx_probe
 
-python3 scripts/resume_train_gemm_amx_probe.py \
+mkdir -p runs/gemm_prevec_ir
+clang -S -emit-llvm -O2 -fno-vectorize -fno-slp-vectorize -fno-unroll-loops \
+  examples/gemm/gemm_scalar.c \
+  -o runs/gemm_prevec_ir/gemm_scalar.ll
+
+python3 scripts/train_region_intrinsic_model.py \
   --region-dir "$REGION_DIR" \
-  --train-instruction-graph-dir "$REGION_DIR/instruction_graphs" \
-  --probe-instruction-graph-dir "$REGION_DIR/instruction_graphs_with_amx" \
-  --model-dir "$MODEL_DIR" \
-  --rounds 6 \
-  --epochs-per-round 5 \
-  --probe-out-dir runs/gemm_recommendations/amx_training_probe \
+  --instruction-graph-dir "$REGION_DIR/instruction_graphs" \
+  --out-dir "$MODEL_DIR" \
+  --epochs 60 \
+  --batch-size 32 \
+  --instruction-batch-size 128 \
+  --hidden-dim 128 \
+  --layers 3 \
+  --dropout 0.15 \
+  --lr 0.001 \
+  --weight-decay 0.0001 \
+  --temperature 0.07 \
+  --match-loss-weight 1.0 \
+  --max-pos-weight 20.0 \
   --device cuda \
-  --snapshot-on-target
+  --probe-every-epochs 5 \
+  --probe-ir-file runs/gemm_prevec_ir/gemm_scalar.ll \
+  --probe-instruction-graph-dir "$REGION_DIR/instruction_graphs_with_amx" \
+  --probe-out-dir "$MODEL_DIR/amx_probe" \
+  --probe-top-k 20 \
+  --probe-store-slice-depth 8 \
+  --probe-store-slice-max-nodes 256
 ```
 
-If `MODEL_DIR` has no `last.pt`, round 1 trains from scratch for
-`--epochs-per-round`; later rounds resume for another chunk. If you want to reuse
-the hyperparameters from an earlier run while writing to a fresh `MODEL_DIR`,
-pass that run's config:
-
-```bash
-  --train-config runs/llvm_vectorize_regions/models/region_intrinsic_x86_store_phi_nomem_v3/config.json
-```
-
-The script writes per-round recommendation files and keeps the checkpoint with
-the best AMX probe rank:
+The trainer writes normal training checkpoints plus the checkpoint with the best
+AMX probe rank:
 
 ```text
-runs/gemm_recommendations/amx_training_probe/probe_history.jsonl
-runs/gemm_recommendations/amx_training_probe/probe_history.md
-runs/gemm_recommendations/amx_training_probe/best_amx_probe.pt
-runs/gemm_recommendations/amx_training_probe/best_amx_probe.json
+$MODEL_DIR/best.pt
+$MODEL_DIR/last.pt
+$MODEL_DIR/best_amx_probe.pt
+$MODEL_DIR/best_amx_probe.json
+$MODEL_DIR/amx_probe/probe_history.jsonl
 ```
 
 The output is inference-only: each candidate region gets a change probability

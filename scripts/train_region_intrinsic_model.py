@@ -2,13 +2,23 @@
 from __future__ import annotations
 
 import argparse
+from collections import Counter
 import json
 import math
 from pathlib import Path
 import random
+import re
 from typing import Any
 
 try:
+    from build_llvm_vectorize_region_dataset import (
+        candidate_regions,
+        extract_defined_functions,
+        parse_candidate_modes,
+        stable_hash,
+        subgraph_symbolic,
+    )
+    from mini_programl_graphs import encode_graph, parse_program_ir_to_graph
     from train_instruction_dual_gnn import (
         RelationalGraphEncoder,
         batch_graphs,
@@ -17,6 +27,14 @@ try:
         load_jsonl,
     )
 except ModuleNotFoundError:  # pragma: no cover - used when imported as a package module
+    from scripts.build_llvm_vectorize_region_dataset import (
+        candidate_regions,
+        extract_defined_functions,
+        parse_candidate_modes,
+        stable_hash,
+        subgraph_symbolic,
+    )
+    from scripts.mini_programl_graphs import encode_graph, parse_program_ir_to_graph
     from scripts.train_instruction_dual_gnn import (
         RelationalGraphEncoder,
         batch_graphs,
@@ -283,6 +301,412 @@ def evaluate(
     }
 
 
+DEFAULT_EXCLUDE_RECOMMENDATION_LABEL_REGEXES = (
+    r"^llvm\.vector\.(?:load|store)\.",
+)
+
+
+def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as file:
+        for row in rows:
+            file.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def compile_label_regexes(patterns: list[str] | tuple[str, ...]) -> list[re.Pattern[str]]:
+    return [re.compile(pattern) for pattern in patterns if pattern]
+
+
+def keep_recommendation_label(row: dict[str, Any], exclude_regexes: list[re.Pattern[str]]) -> bool:
+    label = str(row.get("label", ""))
+    return not any(pattern.search(label) for pattern in exclude_regexes)
+
+
+def load_instruction_vocab(instruction_graph_dir: Path) -> dict[str, Any] | None:
+    vocab_path = instruction_graph_dir / "vocab.json"
+    if not vocab_path.exists():
+        return None
+    return json.loads(vocab_path.read_text(encoding="utf-8"))
+
+
+def instruction_vocab_mismatches(checkpoint_vocab: dict[str, Any], graph_vocab: dict[str, Any] | None) -> list[str]:
+    if graph_vocab is None:
+        return ["missing_vocab_json"]
+    keys = ("token_to_id", "node_type_to_id", "edge_type_to_id", "edge_feature_to_id")
+    return [key for key in keys if checkpoint_vocab.get(key) != graph_vocab.get(key)]
+
+
+def has_symbolic_instruction_graph(row: dict[str, Any]) -> bool:
+    return all(key in row for key in ("node_tokens", "node_types", "symbolic_edges", "edge_features"))
+
+
+def reencode_symbolic_instruction_row(row: dict[str, Any], token_to_id: dict[str, int]) -> dict[str, Any]:
+    symbolic = {
+        "node_tokens": row["node_tokens"],
+        "node_types": row["node_types"],
+        "edges": row["symbolic_edges"],
+        "edge_features": row["edge_features"],
+    }
+    encoded = encode_graph(symbolic, token_to_id)
+    output = dict(row)
+    output.update(
+        {
+            "node_token_ids": encoded["node_token_ids"],
+            "node_type_ids": encoded["node_type_ids"],
+            "edges": encoded["edges"],
+            "edge_feature_ids": encoded["edge_feature_ids"],
+            "edge_counts": encoded["edge_counts"],
+        }
+    )
+    return output
+
+
+def reencode_instruction_rows(
+    rows: list[dict[str, Any]],
+    checkpoint_vocab: dict[str, Any],
+    graph_vocab: dict[str, Any] | None,
+    instruction_graph_dir: Path,
+) -> list[dict[str, Any]]:
+    mismatched = instruction_vocab_mismatches(checkpoint_vocab, graph_vocab)
+    token_to_id = checkpoint_vocab["token_to_id"]
+    output: list[dict[str, Any]] = []
+    missing_symbolic = 0
+    for row in rows:
+        if has_symbolic_instruction_graph(row):
+            output.append(reencode_symbolic_instruction_row(row, token_to_id))
+        else:
+            missing_symbolic += 1
+            output.append(row)
+    if mismatched and missing_symbolic:
+        joined = ", ".join(mismatched)
+        raise SystemExit(
+            "probe instruction graph vocab does not match training checkpoint vocab and "
+            "some graph rows lack symbolic fields needed for re-encoding "
+            f"({joined}). Rebuild probe instruction graphs without --drop-symbols: {instruction_graph_dir}"
+        )
+    return output
+
+
+def make_probe_region_record(
+    source_file: Path,
+    function_name: str,
+    region_index: int,
+    symbolic: dict[str, Any],
+    token_to_id: dict[str, int],
+) -> dict[str, Any]:
+    encoded = encode_graph(symbolic, token_to_id)
+    return {
+        "region_id": stable_hash(
+            f"{source_file}:{function_name}:{region_index}:{symbolic.get('graph_features', {}).get('source_nodes', [])}"
+        )[:16],
+        "source_file": str(source_file),
+        "function_name": function_name,
+        "region_index": region_index,
+        "graph_schema": symbolic.get("graph_schema", "mini-programl"),
+        "graph_kind": symbolic.get("graph_kind", "changed_region"),
+        "num_nodes": len(symbolic["node_tokens"]),
+        "num_edges": len(symbolic["edges"]),
+        "node_token_ids": encoded["node_token_ids"],
+        "node_type_ids": encoded["node_type_ids"],
+        "edges": encoded["edges"],
+        "edge_feature_ids": encoded["edge_feature_ids"],
+        "edge_counts": encoded["edge_counts"],
+        "source_nodes": symbolic.get("graph_features", {}).get("source_nodes", []),
+        "node_tokens": symbolic["node_tokens"],
+        "node_types": symbolic["node_types"],
+        "node_features": symbolic["node_features"],
+        "symbolic_edges": symbolic["edges"],
+        "edge_features": symbolic["edge_features"],
+    }
+
+
+def build_probe_regions_for_ir(
+    ir_file: Path,
+    token_to_id: dict[str, int],
+    max_regions_per_function: int,
+    candidate_modes: tuple[str, ...],
+    store_slice_depth: int,
+    store_slice_max_nodes: int,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    failures: list[dict[str, Any]] = []
+    rows: list[dict[str, Any]] = []
+    ir = ir_file.read_text(encoding="utf-8", errors="replace")
+    functions = extract_defined_functions(ir)
+    if not functions:
+        functions = {ir_file.stem: ir}
+    for function_name, function_ir in functions.items():
+        try:
+            graph = parse_program_ir_to_graph(function_ir)
+            candidates = candidate_regions(
+                graph,
+                modes=candidate_modes,
+                store_slice_depth=store_slice_depth,
+                store_slice_max_nodes=store_slice_max_nodes,
+            )
+        except Exception as exc:  # noqa: BLE001
+            failures.append(
+                {
+                    "source_file": str(ir_file),
+                    "function_name": function_name,
+                    "error": str(exc),
+                }
+            )
+            continue
+        if max_regions_per_function > 0:
+            candidates = candidates[:max_regions_per_function]
+        for region_index, selected in enumerate(candidates):
+            rows.append(
+                make_probe_region_record(
+                    ir_file,
+                    function_name,
+                    region_index,
+                    subgraph_symbolic(graph, selected),
+                    token_to_id,
+                )
+            )
+    return rows, failures
+
+
+def recommendation_entry(row: dict[str, Any], score: float, rank: int) -> dict[str, Any]:
+    return {
+        "rank": rank,
+        "label": row.get("label"),
+        "score": score,
+        "instruction": row.get("instruction"),
+        "intrinsic": row.get("intrinsic"),
+        "extension": row.get("extension"),
+        "architecture": row.get("architecture"),
+    }
+
+
+def predict_probe_recommendations(
+    torch,
+    F,
+    region_encoder,
+    instruction_encoder,
+    change_head,
+    regions: list[dict[str, Any]],
+    instruction_rows: list[dict[str, Any]],
+    batch_size: int,
+    instruction_batch_size: int,
+    top_k: int,
+    temperature: float,
+    device: str,
+) -> list[dict[str, Any]]:
+    region_encoder.eval()
+    instruction_encoder.eval()
+    change_head.eval()
+    output: list[dict[str, Any]] = []
+    top_k = min(top_k, len(instruction_rows))
+    with torch.no_grad():
+        instruction_emb = encode_all(torch, instruction_encoder, instruction_rows, instruction_batch_size, device)
+        for start in range(0, len(regions), batch_size):
+            selected = regions[start : start + batch_size]
+            batch = batch_graphs(torch, selected, 0, len(selected), device)
+            region_emb = region_encoder(batch)
+            change_logits = change_head(region_emb).squeeze(-1)
+            change_probs = torch.sigmoid(change_logits)
+            logits = matching_logits(torch, F, region_emb, instruction_emb, temperature)
+            top_scores, top_indices = torch.topk(logits, k=top_k, dim=1)
+            for row_index, row in enumerate(selected):
+                enriched = dict(row)
+                enriched["change_logit"] = float(change_logits[row_index].item())
+                enriched["change_probability"] = float(change_probs[row_index].item())
+                enriched["recommendations"] = [
+                    recommendation_entry(
+                        instruction_rows[int(label_index)],
+                        float(top_scores[row_index, rank].item()),
+                        rank + 1,
+                    )
+                    for rank, label_index in enumerate(top_indices[row_index].tolist())
+                ]
+                output.append(enriched)
+    return output
+
+
+def write_probe_markdown(path: Path, rows: list[dict[str, Any]], max_rows: int, top_k: int) -> None:
+    selected = sorted(rows, key=lambda row: float(row.get("change_probability", 0.0)), reverse=True)[:max_rows]
+    lines = ["# Region Intrinsic Recommendations", ""]
+    lines.append(f"Showing top {len(selected)} regions by change probability.")
+    lines.append("")
+    for row in selected:
+        lines.append(
+            "## "
+            + f"{Path(str(row.get('source_file'))).name} :: {row.get('function_name')} "
+            + f"region {row.get('region_index')}"
+        )
+        lines.append("")
+        lines.append(f"- change_probability: `{float(row.get('change_probability', 0.0)):.4f}`")
+        lines.append(f"- nodes: `{row.get('num_nodes')}`, edges: `{row.get('num_edges')}`")
+        if row.get("node_tokens"):
+            tokens = " ".join(str(token) for token in row["node_tokens"][:48])
+            lines.append(f"- region_tokens: `{tokens}`")
+        lines.append("")
+        lines.append("| rank | label | score |")
+        lines.append("| ---: | --- | ---: |")
+        for item in row.get("recommendations", [])[:top_k]:
+            lines.append(f"| {item['rank']} | `{item['label']}` | {float(item['score']):.4f} |")
+        lines.append("")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
+def instruction_label_text(row: dict[str, Any]) -> str:
+    return " ".join(
+        str(row.get(key, ""))
+        for key in ("label", "instruction", "intrinsic", "extension", "architecture")
+        if row.get(key)
+    )
+
+
+def count_target_instruction_rows(rows: list[dict[str, Any]], pattern: re.Pattern[str]) -> int:
+    return sum(1 for row in rows if pattern.search(instruction_label_text(row)))
+
+
+def recommendation_matches_target(item: dict[str, Any], pattern: re.Pattern[str]) -> bool:
+    return bool(pattern.search(instruction_label_text(item)))
+
+
+def summarize_probe_recommendations(rows: list[dict[str, Any]], pattern: re.Pattern[str]) -> dict[str, Any]:
+    target_hits: list[dict[str, Any]] = []
+    top1_counts: Counter[str] = Counter()
+    for row in rows:
+        recommendations = row.get("recommendations", [])
+        if recommendations:
+            top1_counts[str(recommendations[0].get("label", ""))] += 1
+        for item in recommendations:
+            if recommendation_matches_target(item, pattern):
+                target_hits.append(
+                    {
+                        "rank": int(item.get("rank", 0)),
+                        "label": item.get("label"),
+                        "score": float(item.get("score", 0.0)),
+                        "function_name": row.get("function_name"),
+                        "region_index": row.get("region_index"),
+                        "change_probability": float(row.get("change_probability", 0.0)),
+                    }
+                )
+                break
+    best_hit = None
+    if target_hits:
+        best_hit = sorted(target_hits, key=lambda hit: (hit["rank"], -hit["score"]))[0]
+    return {
+        "regions": len(rows),
+        "target_hit_regions": len(target_hits),
+        "best_target_hit": best_hit,
+        "top1_label_counts": top1_counts.most_common(10),
+    }
+
+
+def is_better_probe(candidate: dict[str, Any] | None, current: dict[str, Any] | None) -> bool:
+    if not candidate or not candidate.get("best_target_hit"):
+        return False
+    if not current or not current.get("best_target_hit"):
+        return True
+    candidate_hit = candidate["best_target_hit"]
+    current_hit = current["best_target_hit"]
+    candidate_key = (
+        int(candidate_hit.get("rank", 1_000_000)),
+        -int(candidate.get("target_hit_regions", 0)),
+        -float(candidate_hit.get("score", 0.0)),
+        -float(candidate_hit.get("change_probability", 0.0)),
+    )
+    current_key = (
+        int(current_hit.get("rank", 1_000_000)),
+        -int(current.get("target_hit_regions", 0)),
+        -float(current_hit.get("score", 0.0)),
+        -float(current_hit.get("change_probability", 0.0)),
+    )
+    return candidate_key < current_key
+
+
+def load_existing_best_probe(path: Path) -> dict[str, Any] | None:
+    if not path.exists():
+        return None
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    return value if isinstance(value, dict) else None
+
+
+def run_probe_epoch(
+    torch,
+    F,
+    region_encoder,
+    instruction_encoder,
+    change_head,
+    args: argparse.Namespace,
+    region_vocab: dict[str, Any],
+    instruction_vocab: dict[str, Any],
+    device: str,
+    epoch: int,
+) -> dict[str, Any]:
+    graph_instruction_vocab = load_instruction_vocab(args.probe_instruction_graph_dir)
+    probe_instruction_rows = reencode_instruction_rows(
+        load_instruction_graphs(args.probe_instruction_graph_dir),
+        instruction_vocab,
+        graph_instruction_vocab,
+        args.probe_instruction_graph_dir,
+    )
+    exclude_label_regexes = compile_label_regexes(DEFAULT_EXCLUDE_RECOMMENDATION_LABEL_REGEXES)
+    ranking_instruction_rows = [
+        row for row in probe_instruction_rows if keep_recommendation_label(row, exclude_label_regexes)
+    ]
+    if not ranking_instruction_rows:
+        raise SystemExit("no probe instruction graphs remain after recommendation label filtering")
+
+    candidate_modes = parse_candidate_modes(args.probe_candidate_modes)
+    probe_regions: list[dict[str, Any]] = []
+    failures: list[dict[str, Any]] = []
+    for ir_file in args.probe_ir_file:
+        file_regions, file_failures = build_probe_regions_for_ir(
+            ir_file,
+            region_vocab["token_to_id"],
+            max_regions_per_function=args.probe_max_regions_per_function,
+            candidate_modes=candidate_modes,
+            store_slice_depth=args.probe_store_slice_depth,
+            store_slice_max_nodes=args.probe_store_slice_max_nodes,
+        )
+        probe_regions.extend(file_regions)
+        failures.extend(file_failures)
+
+    recommendations = predict_probe_recommendations(
+        torch,
+        F,
+        region_encoder,
+        instruction_encoder,
+        change_head,
+        probe_regions,
+        ranking_instruction_rows,
+        args.batch_size,
+        args.instruction_batch_size,
+        args.probe_top_k,
+        args.temperature,
+        device,
+    )
+    args.probe_out_dir.mkdir(parents=True, exist_ok=True)
+    out_jsonl = args.probe_out_dir / f"epoch_{epoch:04d}.jsonl"
+    out_md = args.probe_out_dir / f"epoch_{epoch:04d}.md"
+    write_jsonl(out_jsonl, recommendations)
+    write_probe_markdown(out_md, recommendations, args.probe_max_report_regions, args.probe_top_k)
+
+    pattern = re.compile(args.probe_target_regex, re.IGNORECASE)
+    summary = summarize_probe_recommendations(recommendations, pattern)
+    summary.update(
+        {
+            "epoch": epoch,
+            "out_jsonl": str(out_jsonl),
+            "out_md": str(out_md),
+            "probe_instruction_graph_dir": str(args.probe_instruction_graph_dir),
+            "probe_ir_file": [str(path) for path in args.probe_ir_file],
+            "probe_failures": failures[:100],
+            "probe_failure_count": len(failures),
+        }
+    )
+    return summary
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Train a diff-supervised changed-region detector and intrinsic matcher."
@@ -314,6 +738,23 @@ def main() -> int:
         default=0,
         help="When resuming, train this many additional epochs instead of treating --epochs as the final epoch.",
     )
+    parser.add_argument(
+        "--probe-every-epochs",
+        type=int,
+        default=0,
+        help="Run a zero-shot recommendation probe every N epochs; 0 disables probing.",
+    )
+    parser.add_argument("--probe-ir-file", type=Path, action="append")
+    parser.add_argument("--probe-instruction-graph-dir", type=Path)
+    parser.add_argument("--probe-out-dir", type=Path)
+    parser.add_argument("--probe-target-regex", default=r"amx|tdpb|tile")
+    parser.add_argument("--probe-top-k", type=int, default=20)
+    parser.add_argument("--probe-candidate-modes", default="store-backward")
+    parser.add_argument("--probe-store-slice-depth", type=int, default=8)
+    parser.add_argument("--probe-store-slice-max-nodes", type=int, default=256)
+    parser.add_argument("--probe-max-regions-per-function", type=int, default=0)
+    parser.add_argument("--probe-max-report-regions", type=int, default=50)
+    parser.add_argument("--allow-probe-target-in-train-graphs", action="store_true")
     args = parser.parse_args()
 
     torch, nn, F = require_torch()
@@ -325,6 +766,19 @@ def main() -> int:
         parser.error("--match-loss-weight must be non-negative")
     if args.resume_extra_epochs < 0:
         parser.error("--resume-extra-epochs must be non-negative")
+    if args.probe_every_epochs < 0:
+        parser.error("--probe-every-epochs must be non-negative")
+    if args.probe_every_epochs > 0:
+        if not args.probe_ir_file:
+            parser.error("--probe-ir-file is required when --probe-every-epochs is positive")
+        if args.probe_instruction_graph_dir is None:
+            parser.error("--probe-instruction-graph-dir is required when --probe-every-epochs is positive")
+        if args.probe_top_k <= 0:
+            parser.error("--probe-top-k must be positive")
+        try:
+            parse_candidate_modes(args.probe_candidate_modes)
+        except ValueError as exc:
+            parser.error(str(exc))
     device = "cuda" if args.device == "auto" and torch.cuda.is_available() else args.device
     if device == "auto":
         device = "cpu"
@@ -335,6 +789,38 @@ def main() -> int:
     train_instruction_rows = [row for row in instruction_rows_all if str(row.get("split", "train")) == "train"]
     if not train_instruction_rows:
         train_instruction_rows = instruction_rows_all
+
+    probe_enabled = args.probe_every_epochs > 0
+    if probe_enabled:
+        if args.probe_out_dir is None:
+            args.probe_out_dir = args.out_dir / "amx_probe"
+        args.probe_out_dir.mkdir(parents=True, exist_ok=True)
+        target_pattern = re.compile(args.probe_target_regex, re.IGNORECASE)
+        train_target_count = count_target_instruction_rows(instruction_rows_all, target_pattern)
+        probe_instruction_rows_for_check = load_instruction_graphs(args.probe_instruction_graph_dir)
+        probe_target_count = count_target_instruction_rows(probe_instruction_rows_for_check, target_pattern)
+        if train_target_count and not args.allow_probe_target_in_train_graphs:
+            raise SystemExit(
+                "training instruction graph directory appears to contain probe target labels "
+                f"({train_target_count} matches). Use a no-AMX training graph directory, or pass "
+                "--allow-probe-target-in-train-graphs intentionally."
+            )
+        if not probe_target_count:
+            raise SystemExit(
+                "probe instruction graph directory has no probe target labels. "
+                "Build it with AMX specs first."
+            )
+        print(
+            json.dumps(
+                {
+                    "probe_target_regex": args.probe_target_regex,
+                    "train_probe_target_label_matches": train_target_count,
+                    "probe_target_label_matches": probe_target_count,
+                    "probe_every_epochs": args.probe_every_epochs,
+                },
+                sort_keys=True,
+            )
+        )
 
     train_path = region_path(args.region_dir, "train")
     if not train_path.exists():
@@ -452,13 +938,26 @@ def main() -> int:
         "resume_extra_epochs": args.resume_extra_epochs,
         "num_train_instruction_graphs": len(train_instruction_rows),
         "num_eval_instruction_graphs": len(instruction_rows_all),
+        "probe_every_epochs": args.probe_every_epochs,
+        "probe_ir_file": [str(path) for path in args.probe_ir_file or []],
+        "probe_instruction_graph_dir": str(args.probe_instruction_graph_dir) if args.probe_instruction_graph_dir else None,
+        "probe_out_dir": str(args.probe_out_dir) if args.probe_out_dir else None,
+        "probe_target_regex": args.probe_target_regex,
+        "probe_top_k": args.probe_top_k,
+        "probe_candidate_modes": args.probe_candidate_modes,
+        "probe_store_slice_depth": args.probe_store_slice_depth,
+        "probe_store_slice_max_nodes": args.probe_store_slice_max_nodes,
     }
     (args.out_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
     best_path = args.out_dir / "best.pt"
     last_path = args.out_dir / "last.pt"
+    best_probe_path = args.out_dir / "best_amx_probe.pt"
+    best_probe_json_path = args.out_dir / "best_amx_probe.json"
     history_path = args.out_dir / "history.json"
+    probe_history_path = (args.probe_out_dir / "probe_history.jsonl") if probe_enabled else None
     history: list[dict[str, Any]] = []
+    probe_history: list[dict[str, Any]] = []
     if args.resume_from is not None and history_path.exists():
         try:
             previous_history = json.loads(history_path.read_text(encoding="utf-8"))
@@ -466,6 +965,9 @@ def main() -> int:
                 history = [row for row in previous_history if int(row.get("epoch", 0)) < start_epoch]
         except json.JSONDecodeError:
             history = []
+    if probe_enabled and probe_history_path and probe_history_path.exists():
+        probe_history = load_jsonl(probe_history_path)
+    best_probe = load_existing_best_probe(best_probe_json_path) if probe_enabled else None
 
     def checkpoint_payload(epoch: int, score: float) -> dict[str, Any]:
         return {
@@ -519,8 +1021,6 @@ def main() -> int:
         selected = metrics.get(args.selection_split, metrics.get("train", {}))
         score = float(selected.get("recall@5", selected.get("change_accuracy", 0.0)))
         row = {"epoch": epoch, "train": train_metrics, **metrics}
-        history.append(row)
-        print(json.dumps(row, sort_keys=True))
         is_best = score > best_score
         if is_best:
             best_score = score
@@ -528,6 +1028,36 @@ def main() -> int:
         torch.save(payload, last_path)
         if is_best:
             torch.save(payload, best_path)
+        if probe_enabled and epoch % args.probe_every_epochs == 0:
+            probe_summary = run_probe_epoch(
+                torch,
+                F,
+                region_encoder,
+                instruction_encoder,
+                change_head,
+                args,
+                region_vocab,
+                instruction_vocab,
+                device,
+                epoch,
+            )
+            probe_updated = is_better_probe(probe_summary, best_probe)
+            probe_summary["best_amx_probe_updated"] = probe_updated
+            if probe_updated:
+                best_probe = probe_summary
+                torch.save(payload, best_probe_path)
+                best_probe_json = dict(probe_summary)
+                best_probe_json["best_amx_probe_checkpoint"] = str(best_probe_path)
+                best_probe_json_path.write_text(
+                    json.dumps(best_probe_json, indent=2, sort_keys=True),
+                    encoding="utf-8",
+                )
+            probe_history.append(probe_summary)
+            if probe_history_path:
+                write_jsonl(probe_history_path, probe_history)
+            row["probe"] = probe_summary
+        history.append(row)
+        print(json.dumps(row, sort_keys=True))
 
     final_metrics = {
         split: evaluate(
@@ -549,6 +1079,9 @@ def main() -> int:
     final_metrics["best_score"] = best_score
     final_metrics["best_checkpoint"] = str(best_path)
     final_metrics["last_checkpoint"] = str(last_path)
+    if best_probe_path.exists():
+        final_metrics["best_amx_probe_checkpoint"] = str(best_probe_path)
+        final_metrics["best_amx_probe"] = load_existing_best_probe(best_probe_json_path)
     (args.out_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
     (args.out_dir / "metrics.json").write_text(json.dumps(final_metrics, indent=2), encoding="utf-8")
     print(json.dumps({"out_dir": str(args.out_dir), "metrics": final_metrics}, sort_keys=True))
