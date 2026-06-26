@@ -214,40 +214,6 @@ def summarize_recommendations(path: Path, pattern: re.Pattern[str]) -> dict[str,
     }
 
 
-def is_better_target_probe(candidate: dict[str, Any], best: dict[str, Any] | None) -> bool:
-    candidate_hit = candidate.get("best_target_hit")
-    if not candidate_hit:
-        return False
-    if best is None or not best.get("best_target_hit"):
-        return True
-    best_hit = best["best_target_hit"]
-    candidate_key = (
-        int(candidate_hit.get("rank", 1_000_000)),
-        -int(candidate.get("target_hit_regions", 0)),
-        -float(candidate_hit.get("score", 0.0)),
-        -float(candidate_hit.get("change_probability", 0.0)),
-    )
-    best_key = (
-        int(best_hit.get("rank", 1_000_000)),
-        -int(best.get("target_hit_regions", 0)),
-        -float(best_hit.get("score", 0.0)),
-        -float(best_hit.get("change_probability", 0.0)),
-    )
-    return candidate_key < best_key
-
-
-def save_best_target_checkpoint(args: argparse.Namespace, summary: dict[str, Any]) -> None:
-    checkpoint = Path(str(summary["checkpoint"]))
-    if not checkpoint.exists():
-        return
-    out_checkpoint = args.probe_out_dir / "best_amx_probe.pt"
-    out_summary = args.probe_out_dir / "best_amx_probe.json"
-    shutil.copy2(checkpoint, out_checkpoint)
-    best_summary = dict(summary)
-    best_summary["best_amx_probe_checkpoint"] = str(out_checkpoint)
-    out_summary.write_text(json.dumps(best_summary, indent=2, sort_keys=True), encoding="utf-8")
-
-
 def run_probe(args: argparse.Namespace, root: Path, gemm_ir: Path, round_index: int) -> dict[str, Any]:
     epoch = latest_epoch(args.model_dir)
     checkpoint = args.model_dir / f"{args.probe_checkpoint}.pt"
@@ -296,7 +262,7 @@ def run_probe(args: argparse.Namespace, root: Path, gemm_ir: Path, round_index: 
             "out_md": str(out_md),
         }
     )
-    if args.snapshot_on_target and summary.get("best_target_hit"):
+    if summary.get("best_target_hit"):
         snapshot_dir = args.probe_out_dir / "checkpoint_snapshots"
         snapshot_dir.mkdir(parents=True, exist_ok=True)
         snapshot = snapshot_dir / f"{stem}_{args.probe_checkpoint}.pt"
@@ -340,14 +306,6 @@ def load_existing_probe_history(path: Path) -> list[dict[str, Any]]:
     return load_jsonl(path)
 
 
-def best_probe_from_history(history: list[dict[str, Any]]) -> dict[str, Any] | None:
-    best: dict[str, Any] | None = None
-    for row in history:
-        if is_better_target_probe(row, best):
-            best = row
-    return best
-
-
 def main() -> int:
     root = repo_root()
     parser = argparse.ArgumentParser(
@@ -388,7 +346,11 @@ def main() -> int:
     parser.add_argument("--target-label-regex", default=r"amx|tdpb|tile")
     parser.add_argument("--allow-target-in-train-graphs", action="store_true")
     parser.add_argument("--allow-no-target-in-probe-graphs", action="store_true")
-    parser.add_argument("--snapshot-on-target", action="store_true")
+    parser.add_argument(
+        "--snapshot-on-target",
+        action="store_true",
+        help="Deprecated; target-hit checkpoints are now always snapshotted.",
+    )
     args = parser.parse_args()
 
     if args.rounds <= 0:
@@ -434,18 +396,11 @@ def main() -> int:
     gemm_ir = compile_gemm_ir(args, root)
     history_path = args.probe_out_dir / "probe_history.jsonl"
     history = load_existing_probe_history(history_path)
-    best_probe = best_probe_from_history(history)
     start_round = len(history) + 1
     for offset in range(args.rounds):
         round_index = start_round + offset
         train_one_round(args, root, round_index)
         summary = run_probe(args, root, gemm_ir, round_index)
-        if is_better_target_probe(summary, best_probe):
-            save_best_target_checkpoint(args, summary)
-            summary["best_amx_probe_updated"] = True
-            best_probe = summary
-        else:
-            summary["best_amx_probe_updated"] = False
         history.append(summary)
         write_jsonl(history_path, history)
         write_history_markdown(args.probe_out_dir / "probe_history.md", history)

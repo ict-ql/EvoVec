@@ -598,36 +598,42 @@ def summarize_probe_recommendations(rows: list[dict[str, Any]], pattern: re.Patt
     }
 
 
-def is_better_probe(candidate: dict[str, Any] | None, current: dict[str, Any] | None) -> bool:
-    if not candidate or not candidate.get("best_target_hit"):
-        return False
-    if not current or not current.get("best_target_hit"):
-        return True
-    candidate_hit = candidate["best_target_hit"]
-    current_hit = current["best_target_hit"]
-    candidate_key = (
-        int(candidate_hit.get("rank", 1_000_000)),
-        -int(candidate.get("target_hit_regions", 0)),
-        -float(candidate_hit.get("score", 0.0)),
-        -float(candidate_hit.get("change_probability", 0.0)),
-    )
-    current_key = (
-        int(current_hit.get("rank", 1_000_000)),
-        -int(current.get("target_hit_regions", 0)),
-        -float(current_hit.get("score", 0.0)),
-        -float(current_hit.get("change_probability", 0.0)),
-    )
-    return candidate_key < current_key
+def probe_candidate_stem(summary: dict[str, Any]) -> str:
+    hit = summary.get("best_target_hit") or {}
+    epoch = int(summary.get("epoch", 0))
+    rank = int(hit.get("rank", 0))
+    hit_regions = int(summary.get("target_hit_regions", 0))
+    return f"epoch_{epoch:04d}_rank_{rank:02d}_hits_{hit_regions:03d}"
 
 
-def load_existing_best_probe(path: Path) -> dict[str, Any] | None:
-    if not path.exists():
-        return None
-    try:
-        value = json.loads(path.read_text(encoding="utf-8"))
-    except json.JSONDecodeError:
-        return None
-    return value if isinstance(value, dict) else None
+def unique_artifact_paths(directory: Path, stem: str) -> tuple[Path, Path]:
+    checkpoint_path = directory / f"{stem}.pt"
+    metadata_path = directory / f"{stem}.json"
+    suffix = 2
+    while checkpoint_path.exists() or metadata_path.exists():
+        checkpoint_path = directory / f"{stem}_{suffix}.pt"
+        metadata_path = directory / f"{stem}_{suffix}.json"
+        suffix += 1
+    return checkpoint_path, metadata_path
+
+
+def save_probe_candidate_checkpoint(
+    torch,
+    payload: dict[str, Any],
+    summary: dict[str, Any],
+    candidate_dir: Path,
+) -> dict[str, Any]:
+    if not summary.get("best_target_hit"):
+        summary["amx_probe_candidate_saved"] = False
+        return summary
+    candidate_dir.mkdir(parents=True, exist_ok=True)
+    checkpoint_path, metadata_path = unique_artifact_paths(candidate_dir, probe_candidate_stem(summary))
+    torch.save(payload, checkpoint_path)
+    summary["amx_probe_candidate_saved"] = True
+    summary["amx_probe_candidate_checkpoint"] = str(checkpoint_path)
+    summary["amx_probe_candidate_metadata"] = str(metadata_path)
+    metadata_path.write_text(json.dumps(summary, indent=2, sort_keys=True), encoding="utf-8")
+    return summary
 
 
 def run_probe_epoch(
@@ -947,13 +953,13 @@ def main() -> int:
         "probe_candidate_modes": args.probe_candidate_modes,
         "probe_store_slice_depth": args.probe_store_slice_depth,
         "probe_store_slice_max_nodes": args.probe_store_slice_max_nodes,
+        "probe_candidate_checkpoint_dir": str(args.out_dir / "amx_probe_candidates") if probe_enabled else None,
     }
     (args.out_dir / "config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
 
     best_path = args.out_dir / "best.pt"
     last_path = args.out_dir / "last.pt"
-    best_probe_path = args.out_dir / "best_amx_probe.pt"
-    best_probe_json_path = args.out_dir / "best_amx_probe.json"
+    probe_candidate_dir = args.out_dir / "amx_probe_candidates"
     history_path = args.out_dir / "history.json"
     probe_history_path = (args.probe_out_dir / "probe_history.jsonl") if probe_enabled else None
     history: list[dict[str, Any]] = []
@@ -967,7 +973,6 @@ def main() -> int:
             history = []
     if probe_enabled and probe_history_path and probe_history_path.exists():
         probe_history = load_jsonl(probe_history_path)
-    best_probe = load_existing_best_probe(best_probe_json_path) if probe_enabled else None
 
     def checkpoint_payload(epoch: int, score: float) -> dict[str, Any]:
         return {
@@ -1041,17 +1046,12 @@ def main() -> int:
                 device,
                 epoch,
             )
-            probe_updated = is_better_probe(probe_summary, best_probe)
-            probe_summary["best_amx_probe_updated"] = probe_updated
-            if probe_updated:
-                best_probe = probe_summary
-                torch.save(payload, best_probe_path)
-                best_probe_json = dict(probe_summary)
-                best_probe_json["best_amx_probe_checkpoint"] = str(best_probe_path)
-                best_probe_json_path.write_text(
-                    json.dumps(best_probe_json, indent=2, sort_keys=True),
-                    encoding="utf-8",
-                )
+            probe_summary = save_probe_candidate_checkpoint(
+                torch,
+                payload,
+                probe_summary,
+                probe_candidate_dir,
+            )
             probe_history.append(probe_summary)
             if probe_history_path:
                 write_jsonl(probe_history_path, probe_history)
@@ -1079,9 +1079,13 @@ def main() -> int:
     final_metrics["best_score"] = best_score
     final_metrics["best_checkpoint"] = str(best_path)
     final_metrics["last_checkpoint"] = str(last_path)
-    if best_probe_path.exists():
-        final_metrics["best_amx_probe_checkpoint"] = str(best_probe_path)
-        final_metrics["best_amx_probe"] = load_existing_best_probe(best_probe_json_path)
+    if probe_enabled:
+        final_metrics["amx_probe_candidate_checkpoint_dir"] = str(probe_candidate_dir)
+        final_metrics["amx_probe_candidate_checkpoints"] = [
+            str(row["amx_probe_candidate_checkpoint"])
+            for row in probe_history
+            if row.get("amx_probe_candidate_checkpoint")
+        ]
     (args.out_dir / "history.json").write_text(json.dumps(history, indent=2), encoding="utf-8")
     (args.out_dir / "metrics.json").write_text(json.dumps(final_metrics, indent=2), encoding="utf-8")
     print(json.dumps({"out_dir": str(args.out_dir), "metrics": final_metrics}, sort_keys=True))

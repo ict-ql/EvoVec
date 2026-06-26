@@ -349,14 +349,15 @@ python3 scripts/train_region_intrinsic_model.py \
   --probe-store-slice-max-nodes 256
 ```
 
-The trainer writes normal training checkpoints plus the checkpoint with the best
-AMX probe rank:
+The trainer writes normal training checkpoints, a probe report for every probe
+epoch, and one candidate checkpoint for every probe epoch whose top-k
+recommendations include an AMX/tdpb/tile target:
 
 ```text
 $MODEL_DIR/best.pt
 $MODEL_DIR/last.pt
-$MODEL_DIR/best_amx_probe.pt
-$MODEL_DIR/best_amx_probe.json
+$MODEL_DIR/amx_probe_candidates/epoch_*.pt
+$MODEL_DIR/amx_probe_candidates/epoch_*.json
 $MODEL_DIR/amx_probe/probe_history.jsonl
 ```
 
