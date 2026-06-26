@@ -258,6 +258,30 @@ python3 scripts/recommend_region_intrinsics.py \
   --device cuda
 ```
 
+For all split TSVC kernels, use the batch wrapper. It emits scalar IR for each
+kernel in `runs/manifests/tsvc_kernels.jsonl`, then keeps the top 20
+recommendations per candidate region. On a remote Ubuntu server, regenerate the
+manifest on that server so the absolute paths point to the remote checkout; if
+you copied a manifest from another machine, pass `--tsvc-root` with the remote
+`runs/tsvc_kernels/v1` path.
+
+```bash
+python3 scripts/prepare_tsvc_kernels.py \
+  --src-dir third_party/TSVC_2/src \
+  --out-dir runs/tsvc_kernels/v1 \
+  --manifest runs/manifests/tsvc_kernels.jsonl \
+  --kernels all
+
+python3 scripts/run_tsvc_region_inference.py \
+  --manifest runs/manifests/tsvc_kernels.jsonl \
+  --tsvc-root runs/tsvc_kernels/v1 \
+  --checkpoint runs/llvm_vectorize_regions/models/region_intrinsic_x86_v1/best.pt \
+  --instruction-graph-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs \
+  --out-dir runs/tsvc_region_recommendations/top20 \
+  --top-k 20 \
+  --device cuda
+```
+
 For a quick AMX smoke test, emit scalar GEMM IR and run the no-AMX checkpoint
 against the inference-time instruction graph directory that contains AMX:
 
