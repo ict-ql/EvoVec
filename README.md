@@ -300,6 +300,7 @@ python3 scripts/run_tsvc_ir_optimization_experiment.py \
   --temperature 0.2 \
   --modes baseline,guided \
   --limit 10 \
+  --target-cpu auto \
   --clang clang \
   --cc cc
 ```
@@ -307,6 +308,9 @@ python3 scripts/run_tsvc_ir_optimization_experiment.py \
 The exact prompts, model outputs, compile/run logs, and per-kernel records are
 written under the output directory. `summary.json` reports success counts, mean
 times, and paired guided-vs-baseline speedup when both modes pass correctness.
+The runner uses `clang -march=native -###` to detect the concrete LLVM target CPU
+for the prompt and records it in `target.json`; pass `--target-cpu znver4` or a
+similar LLVM CPU name to override auto-detection.
 The same LLM client is available directly as `python3 scripts/ask_llm.py`, which
 reads from stdin, `-p`, or `--file` and uses the same config format. Keep API
 keys out of git; set `OPENAI_API_KEY` or pass a private config file.

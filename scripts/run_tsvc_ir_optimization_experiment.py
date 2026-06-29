@@ -15,6 +15,7 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(REPO_ROOT / "src"))
 DEFAULT_TEMPLATE = REPO_ROOT / "prompts/llvm_ir_vectorize_fast_v1.txt"
 
 
@@ -329,12 +330,16 @@ def render_prompt(
     source_ir: str,
     recommendation_block: str,
     target: str,
+    target_cpu: str,
+    target_cpu_name: str,
     target_notes: str,
 ) -> str:
     return template.format(
         kernel=task["kernel"],
         mode=mode,
         target=target,
+        target_cpu=target_cpu,
+        target_cpu_name=target_cpu_name,
         target_notes=target_notes,
         recommendation_block=recommendation_block,
         source_ir=source_ir,
@@ -409,6 +414,8 @@ def run_mode(
         source_ir=scalar_ir,
         recommendation_block=recommendation_block,
         target=args.target,
+        target_cpu=args.target_cpu,
+        target_cpu_name=args.target_cpu_name,
         target_notes=args.target_notes,
     )
     prompt_path = mode_dir / "prompt.txt"
@@ -506,6 +513,17 @@ def main() -> int:
     parser.add_argument("--limit", type=int, default=3)
     parser.add_argument("--modes", default="baseline,guided")
     parser.add_argument("--target", default="x86_64-pc-linux-gnu")
+    parser.add_argument(
+        "--target-cpu",
+        default="auto",
+        help="LLVM target CPU to describe in prompts; 'auto' detects clang -march=native.",
+    )
+    parser.add_argument(
+        "--target-cpu-name",
+        default="",
+        help="Human-readable CPU model name for prompts; auto-detected when omitted.",
+    )
+    parser.add_argument("--target-detect-timeout", type=int, default=10)
     parser.add_argument("--target-notes", default="System V AMD64 ABI, optimize for native x86 vector execution.")
     parser.add_argument("--cc", default="cc")
     parser.add_argument("--clang", default="clang")
@@ -531,7 +549,6 @@ def main() -> int:
         parser.error("--recommendation-top-k must be positive")
 
     if not args.prompt_only and not args.agent_cmd:
-        sys.path.insert(0, str(REPO_ROOT / "src"))
         from neural_asm_pipeline.llm_client import client_from_config, config_value
 
         client, section = client_from_config(
@@ -546,6 +563,18 @@ def main() -> int:
         args.model = args.model or "agent-cmd"
         args.api_mode = args.api_mode or "agent-cmd"
 
+    from neural_asm_pipeline.target_detect import detect_target
+
+    target_info = detect_target(
+        compiler=args.clang,
+        target=args.target,
+        target_cpu=args.target_cpu,
+        target_cpu_name=args.target_cpu_name,
+        timeout=args.target_detect_timeout,
+    )
+    args.target_cpu = str(target_info["target_cpu"])
+    args.target_cpu_name = str(target_info["target_cpu_name"])
+
     modes = parse_modes(args.modes)
     template = args.template.read_text(encoding="utf-8")
     recommendations = load_recommendations(args.recommendations_jsonl)
@@ -554,6 +583,7 @@ def main() -> int:
         parser.error("selected task range is empty")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    (args.out_dir / "target.json").write_text(json.dumps(target_info, indent=2), encoding="utf-8")
     records_path = args.out_dir / "records.jsonl"
     records_path.write_text("", encoding="utf-8")
     records: list[dict[str, Any]] = []
@@ -652,6 +682,10 @@ def main() -> int:
     summary: dict[str, Any] = {
         "tasks": len(records),
         "modes": modes,
+        "target": args.target,
+        "target_cpu": args.target_cpu,
+        "target_cpu_name": args.target_cpu_name,
+        "target_info": str(args.out_dir / "target.json"),
         "prompt_only": args.prompt_only,
         "records": str(records_path),
         "successes": {
