@@ -283,42 +283,82 @@ def load_recommendations(path: Path | None) -> dict[str, list[dict[str, Any]]]:
     return grouped
 
 
-def format_recommendations(rows: list[dict[str, Any]], max_regions: int, top_k: int) -> str:
-    if not rows:
-        return ""
-    selected = sorted(
+VECTOR_TYPE_RE = re.compile(r"^v(?P<lanes>\d+)(?:x)?(?P<elem>[A-Za-z0-9]+)$")
+
+
+def hint_text(item: dict[str, Any]) -> str:
+    intrinsic = str(item.get("intrinsic") or "").strip()
+    label = str(item.get("label") or "").strip()
+    return intrinsic or label
+
+
+def vector_hint_key(text: str) -> tuple[str, str] | None:
+    parts = text.split(".")
+    vector_indices = [index for index, part in enumerate(parts) if VECTOR_TYPE_RE.fullmatch(part)]
+    if not vector_indices:
+        return None
+    index = vector_indices[-1]
+    vector = VECTOR_TYPE_RE.fullmatch(parts[index])
+    assert vector is not None
+    elem = vector.group("elem")
+    base = ".".join(parts[:index])
+    suffix = ".".join(parts[index + 1 :])
+    return (f"{base}.*{suffix}", elem)
+
+
+def vector_hint_width(text: str) -> int:
+    widths = [
+        int(match.group("lanes"))
+        for part in text.split(".")
+        if (match := VECTOR_TYPE_RE.fullmatch(part))
+    ]
+    return max(widths) if widths else 0
+
+
+def compact_hint_texts(rows: list[dict[str, Any]], max_regions: int, top_k: int) -> list[str]:
+    selected_rows = sorted(
         rows,
         key=lambda row: float(row.get("change_probability", 0.0)),
         reverse=True,
     )[:max_regions]
+    best_by_vector_key: dict[tuple[str, str], str] = {}
+    scalar_hints: list[str] = []
+    seen_scalar: set[str] = set()
+    for row in selected_rows:
+        for item in row.get("recommendations", [])[:top_k]:
+            text = hint_text(item)
+            if not text:
+                continue
+            key = vector_hint_key(text)
+            if key is None:
+                if text not in seen_scalar:
+                    scalar_hints.append(text)
+                    seen_scalar.add(text)
+                continue
+            current = best_by_vector_key.get(key)
+            if current is None or vector_hint_width(text) > vector_hint_width(current):
+                best_by_vector_key[key] = text
+    compacted: list[str] = []
+    seen: set[str] = set()
+    for text in [*scalar_hints, *best_by_vector_key.values()]:
+        if text in seen:
+            continue
+        compacted.append(text)
+        seen.add(text)
+    return compacted
+
+
+def format_recommendations(rows: list[dict[str, Any]], max_regions: int, top_k: int) -> str:
+    hints = compact_hint_texts(rows, max_regions, top_k)
+    if not hints:
+        return ""
     lines = [
         "Retriever-proposed vectorization hints:",
         "- Treat these as optional optimization hints, not mandatory rewrites.",
         "- Prefer a hint only when it is semantically valid for the IR and profitable for the target.",
+        "- Candidate operations/intrinsics:",
     ]
-    for row in selected:
-        lines.append(
-            "- region {region_index}: change_probability={change_probability:.4f}, nodes={nodes}, edges={edges}".format(
-                region_index=row.get("region_index"),
-                change_probability=float(row.get("change_probability", 0.0)),
-                nodes=row.get("num_nodes"),
-                edges=row.get("num_edges"),
-            )
-        )
-        tokens = row.get("node_tokens") or []
-        if tokens:
-            lines.append("  region_tokens: " + " ".join(str(token) for token in tokens[:48]))
-        for item in row.get("recommendations", [])[:top_k]:
-            parts = [
-                f"rank={item.get('rank')}",
-                f"label={item.get('label')}",
-                f"score={float(item.get('score', 0.0)):.4f}",
-            ]
-            if item.get("intrinsic"):
-                parts.append(f"intrinsic={item.get('intrinsic')}")
-            if item.get("instruction"):
-                parts.append(f"instruction={item.get('instruction')}")
-            lines.append("  - " + ", ".join(parts))
+    lines.extend(f"  - {hint}" for hint in hints)
     return "\n".join(lines)
 
 
