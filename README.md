@@ -313,6 +313,10 @@ The runner records target details in `target.json`. It first asks
 `gcc -Q --help=target -march=native` and CPU-model heuristics when clang reports
 only `native`; pass `--target-cpu znver4` or a similar LLVM CPU name to override
 auto-detection.
+The scalar IR shown to the LLM and the generated candidate IR used for
+verification are patched with the detected `"target-cpu"` and
+`"target-features"` function attributes by default, matching the native compile
+path. Pass `--no-target-attributes` only for ablations.
 The same LLM client is available directly as `python3 scripts/ask_llm.py`, which
 reads from stdin, `-p`, or `--file` and uses the same config format. Keep API
 keys out of git; set `OPENAI_API_KEY` or pass a private config file.

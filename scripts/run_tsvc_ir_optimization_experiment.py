@@ -165,6 +165,7 @@ def compile_scalar_ir(args: argparse.Namespace, task: dict[str, Any], ir_path: P
         "-fno-vectorize",
         "-fno-slp-vectorize",
         "-fno-unroll-loops",
+        f"-march={args.target_attr_march}",
         "-I",
         str(paths["support_dir"]),
         str(paths["reference_kernel"]),
@@ -182,7 +183,7 @@ def build_reference(args: argparse.Namespace, task: dict[str, Any], out_dir: Pat
     cmd = [
         args.cc,
         "-O3",
-        "-march=native",
+        f"-march={args.target_attr_march}",
         "-no-pie",
         "-I",
         str(support),
@@ -224,7 +225,7 @@ def build_and_run_ir(
     cmd = [
         args.clang,
         "-O3",
-        "-march=native",
+        f"-march={args.target_attr_march}",
         "-no-pie",
         "-I",
         str(support),
@@ -262,6 +263,14 @@ def build_and_run_ir(
         "checksum_ok": checksum_ok,
         "ok": bool(compile_result["ok"] and run_result and run_result["ok"] and parsed and parsed["ok"] and checksum_ok),
     }
+
+
+def patch_target_attributes_if_enabled(args: argparse.Namespace, ir_path: Path) -> dict[str, Any]:
+    if args.no_target_attributes:
+        return {"patched": False, "disabled": True, "path": str(ir_path)}
+    from neural_asm_pipeline.target_attributes import patch_ir_file
+
+    return patch_ir_file(ir_path, args.target_attributes)
 
 
 def recommendation_key(row: dict[str, Any]) -> str:
@@ -495,6 +504,7 @@ def run_mode(
 
     candidate_ir = strip_markdown_fence(str(llm_result["stdout"]))
     candidate_ir_path.write_text(candidate_ir, encoding="utf-8")
+    attr_patch = patch_target_attributes_if_enabled(args, candidate_ir_path)
     verify_result = build_and_run_ir(args, task, candidate_ir_path, mode_dir / "candidate", expected_checksum)
     verify_path.write_text(json.dumps(verify_result, indent=2), encoding="utf-8")
     parsed = verify_result.get("parsed") or {}
@@ -505,6 +515,7 @@ def run_mode(
             "compile_ok": verify_result["compile"]["ok"],
             "run_ok": bool(verify_result.get("run") and verify_result["run"]["ok"]),
             "checksum_ok": verify_result["checksum_ok"],
+            "target_attribute_patch": attr_patch,
             "observed_checksum": parsed.get("checksum"),
             "observed_time_sec": observed_time,
             "reference_time_sec": reference_time,
@@ -572,6 +583,16 @@ def main() -> int:
     )
     parser.add_argument("--target-detect-timeout", type=int, default=10)
     parser.add_argument("--target-notes", default="System V AMD64 ABI, optimize for native x86 vector execution.")
+    parser.add_argument(
+        "--target-attr-march",
+        default="native",
+        help="Architecture passed to clang -march when detecting and emitting target attributes.",
+    )
+    parser.add_argument(
+        "--no-target-attributes",
+        action="store_true",
+        help="Do not inject target-cpu/target-features attributes into scalar or generated IR.",
+    )
     parser.add_argument("--cc", default="cc")
     parser.add_argument("--clang", default="clang")
     parser.add_argument("--scalar-opt-level", default="3", choices=["0", "1", "2", "3", "s", "z"])
@@ -621,6 +642,19 @@ def main() -> int:
     )
     args.target_cpu = str(target_info["target_cpu"])
     args.target_cpu_name = str(target_info["target_cpu_name"])
+    target_attr_info: dict[str, Any] = {"attributes": {}, "disabled": args.no_target_attributes}
+    if not args.no_target_attributes:
+        from neural_asm_pipeline.target_attributes import target_attribute_values
+
+        target_attr_info = target_attribute_values(
+            clang=args.clang,
+            target=args.target,
+            target_cpu=args.target_cpu,
+            fallback_features=target_info.get("target_features", []),
+            march=args.target_attr_march,
+            timeout=args.target_detect_timeout,
+        )
+    args.target_attributes = dict(target_attr_info.get("attributes", {}))
 
     modes = parse_modes(args.modes)
     template = args.template.read_text(encoding="utf-8")
@@ -630,6 +664,7 @@ def main() -> int:
         parser.error("selected task range is empty")
 
     args.out_dir.mkdir(parents=True, exist_ok=True)
+    target_info["target_attributes"] = target_attr_info
     (args.out_dir / "target.json").write_text(json.dumps(target_info, indent=2), encoding="utf-8")
     records_path = args.out_dir / "records.jsonl"
     records_path.write_text("", encoding="utf-8")
@@ -656,6 +691,11 @@ def main() -> int:
                 file.write(json.dumps(record, sort_keys=True) + "\n")
             print(json.dumps({"task_index": task_index, "kernel": kernel, "ok": False, "error": record["error"]}), flush=True)
             continue
+        scalar_attr_patch = patch_target_attributes_if_enabled(args, scalar_ir_path)
+        (task_dir / "scalar_ir_target_attrs.json").write_text(
+            json.dumps(scalar_attr_patch, indent=2),
+            encoding="utf-8",
+        )
 
         reference = build_reference(args, task, task_dir / "reference")
         (task_dir / "reference.json").write_text(json.dumps(reference, indent=2), encoding="utf-8")
@@ -688,6 +728,7 @@ def main() -> int:
             "scalar_ir": str(scalar_ir_path),
             "reference_time_sec": reference_time,
             "scalar_ir_time_sec": scalar_time,
+            "scalar_ir_target_attribute_patch": scalar_attr_patch,
             "expected_checksum": expected_checksum,
             "recommendation_regions": len(recommendation_rows),
             "modes": {},
