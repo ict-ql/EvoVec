@@ -284,12 +284,19 @@ def load_recommendations(path: Path | None) -> dict[str, list[dict[str, Any]]]:
 
 
 VECTOR_TYPE_RE = re.compile(r"^v(?P<lanes>\d+)(?:x)?(?P<elem>[A-Za-z0-9]+)$")
+LLVM_INTRINSIC_ALIASES = {
+    "_tile_dpbssd": "llvm.x86.tdpbssd.internal",
+    "_tile_dpbusd": "llvm.x86.tdpbusd.internal",
+    "amx.tile.tdpbssd": "llvm.x86.tdpbssd.internal",
+    "amx.tile.tdpbusd": "llvm.x86.tdpbusd.internal",
+}
 
 
 def hint_text(item: dict[str, Any]) -> str:
     intrinsic = str(item.get("intrinsic") or "").strip()
     label = str(item.get("label") or "").strip()
-    return intrinsic or label
+    text = intrinsic or label
+    return LLVM_INTRINSIC_ALIASES.get(text, text)
 
 
 def vector_hint_key(text: str) -> tuple[str, str] | None:
