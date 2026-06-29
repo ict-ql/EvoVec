@@ -282,6 +282,35 @@ python3 scripts/run_tsvc_region_inference.py \
   --device cuda
 ```
 
+To test whether recommendation-guided IR optimization improves TSVC runtime,
+run the baseline and guided LLM paths side by side. The baseline prompt receives
+only pre-vectorization LLVM IR; the guided prompt receives the same IR plus the
+top recommendation rows from the retriever. Both paths must return complete
+LLVM IR, which is linked into the existing TSVC harness and checked by checksum:
+
+```bash
+python3 scripts/run_tsvc_ir_optimization_experiment.py \
+  --manifest runs/manifests/tsvc_kernels.jsonl \
+  --tsvc-root runs/tsvc_kernels/v1 \
+  --recommendations-jsonl runs/tsvc_region_recommendations/top20/recommendations.jsonl \
+  --out-dir runs/tsvc_ir_opt/gpt5_top20 \
+  --llm-config config/llm.example.yaml \
+  --model gpt-5 \
+  --max-tokens 16000 \
+  --temperature 0.2 \
+  --modes baseline,guided \
+  --limit 10 \
+  --clang clang \
+  --cc cc
+```
+
+The exact prompts, model outputs, compile/run logs, and per-kernel records are
+written under the output directory. `summary.json` reports success counts, mean
+times, and paired guided-vs-baseline speedup when both modes pass correctness.
+The same LLM client is available directly as `python3 scripts/ask_llm.py`, which
+reads from stdin, `-p`, or `--file` and uses the same config format. Keep API
+keys out of git; set `OPENAI_API_KEY` or pass a private config file.
+
 For a quick AMX smoke test, emit scalar GEMM IR and run the no-AMX checkpoint
 against the inference-time instruction graph directory that contains AMX:
 

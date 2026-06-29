@@ -1,0 +1,5 @@
+llm:
+  base_url: ""
+  api_key: ""
+  llm_model: gpt-5
+  api_mode: auto

@@ -1,0 +1,20 @@
+You are an LLVM IR optimization agent for one isolated TSVC kernel.
+
+Task:
+- Input is pre-vectorization LLVM IR for TSVC kernel `{kernel}`.
+- Return a complete optimized LLVM IR module for the same kernel.
+- Preserve the externally visible function name, function signature, return type, and observable checksum behavior.
+- Keep externally linked globals, helper calls, and ABI-compatible declarations usable by the existing TSVC harness.
+- Do not output C, assembly, explanations, markdown, or comments outside the IR module.
+- Use target `{target}`. Notes: {target_notes}
+
+Optimization mode: {mode}
+
+{recommendation_block}
+
+Pre-vectorization LLVM IR:
+```llvm
+{source_ir}
+```
+
+Return only the optimized LLVM IR module.
