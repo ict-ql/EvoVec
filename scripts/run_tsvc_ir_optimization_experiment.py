@@ -15,7 +15,7 @@ from typing import Any
 
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_TEMPLATE = REPO_ROOT / "prompts/tsvc_ir_optimize_fast_v1.txt"
+DEFAULT_TEMPLATE = REPO_ROOT / "prompts/llvm_ir_vectorize_fast_v1.txt"
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -284,18 +284,16 @@ def load_recommendations(path: Path | None) -> dict[str, list[dict[str, Any]]]:
 
 def format_recommendations(rows: list[dict[str, Any]], max_regions: int, top_k: int) -> str:
     if not rows:
-        return (
-            "No model recommendations were provided for this kernel. "
-            "Optimize using only the scalar IR."
-        )
+        return ""
     selected = sorted(
         rows,
         key=lambda row: float(row.get("change_probability", 0.0)),
         reverse=True,
     )[:max_regions]
     lines = [
-        "Recommended vector/intrinsic labels from the retrieval model.",
-        "Use these as hints, not as mandatory rewrites; preserve correctness if a hint is unsafe.",
+        "Retriever-proposed vectorization hints:",
+        "- Treat these as optional optimization hints, not mandatory rewrites.",
+        "- Prefer a hint only when it is semantically valid for the IR and profitable for the target.",
     ]
     for row in selected:
         lines.append(
@@ -396,7 +394,7 @@ def run_mode(
     mode_dir = task_dir / mode
     mode_dir.mkdir(parents=True, exist_ok=True)
     recommendation_block = (
-        "No retrieval recommendations are provided in baseline mode."
+        ""
         if mode == "baseline"
         else format_recommendations(
             recommendation_rows,
