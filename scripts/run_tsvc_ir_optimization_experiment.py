@@ -292,6 +292,40 @@ def load_recommendations(path: Path | None) -> dict[str, list[dict[str, Any]]]:
     return grouped
 
 
+def load_intrinsic_declarations(path: Path | None) -> dict[str, str]:
+    if path is None:
+        return {}
+    if path.suffix.lower() == ".jsonl":
+        rows = load_jsonl(path)
+        return {
+            str(row["name"]): str(row["declaration"]).strip()
+            for row in rows
+            if row.get("name") and str(row.get("declaration", "")).strip()
+        }
+    data = json.loads(path.read_text(encoding="utf-8"))
+    if isinstance(data, dict) and isinstance(data.get("declarations"), dict):
+        return {
+            str(name): str(declaration).strip()
+            for name, declaration in data["declarations"].items()
+            if str(declaration).strip()
+        }
+    if isinstance(data, dict):
+        return {
+            str(name): str(declaration).strip()
+            for name, declaration in data.items()
+            if isinstance(declaration, str) and declaration.strip()
+        }
+    if isinstance(data, list):
+        return {
+            str(row["name"]): str(row["declaration"]).strip()
+            for row in data
+            if isinstance(row, dict)
+            and row.get("name")
+            and str(row.get("declaration", "")).strip()
+        }
+    raise SystemExit(f"unsupported intrinsic declaration JSON shape: {path}")
+
+
 VECTOR_TYPE_RE = re.compile(r"^v(?P<lanes>\d+)(?:x)?(?P<elem>[A-Za-z0-9]+)$")
 LLVM_INTRINSIC_ALIASES = {
     "_tile_dpbssd": "llvm.x86.tdpbssd.internal",
@@ -364,17 +398,32 @@ def compact_hint_texts(rows: list[dict[str, Any]], max_regions: int, top_k: int)
     return compacted
 
 
-def format_recommendations(rows: list[dict[str, Any]], max_regions: int, top_k: int) -> str:
+def format_recommendations(
+    rows: list[dict[str, Any]],
+    max_regions: int,
+    top_k: int,
+    intrinsic_declarations: dict[str, str],
+) -> str:
     hints = compact_hint_texts(rows, max_regions, top_k)
     if not hints:
         return ""
+    has_declarations = any(intrinsic_declarations.get(hint) for hint in hints)
     lines = [
         "Retriever-proposed vectorization hints:",
         "- Treat these as optional optimization hints, not mandatory rewrites.",
         "- Prefer a hint only when it is semantically valid for the IR and profitable for the target.",
-        "- Candidate operations/intrinsics:",
     ]
-    lines.extend(f"  - {hint}" for hint in hints)
+    if has_declarations:
+        lines.append(
+            "- Exact declarations are generated from LLVM; if you use one of these intrinsics, "
+            "match its declaration and call operand order exactly."
+        )
+    lines.append("- Candidate operations/intrinsics:")
+    for hint in hints:
+        declaration = intrinsic_declarations.get(hint, "")
+        lines.append(f"  - {hint}")
+        if declaration:
+            lines.append(f"    exact LLVM declaration: {declaration}")
     return "\n".join(lines)
 
 
@@ -461,6 +510,7 @@ def run_mode(
             recommendation_rows,
             args.max_recommendation_regions,
             args.recommendation_top_k,
+            args.intrinsic_declarations,
         )
     )
     prompt = render_prompt(
@@ -550,6 +600,11 @@ def main() -> int:
     )
     parser.add_argument("--manifest", type=Path, required=True)
     parser.add_argument("--recommendations-jsonl", type=Path)
+    parser.add_argument(
+        "--intrinsic-declarations-json",
+        type=Path,
+        help="JSON/JSONL map produced by resolve_llvm_intrinsic_declarations.py.",
+    )
     parser.add_argument("--out-dir", type=Path, required=True)
     parser.add_argument("--agent-cmd", default="", help="Compatibility path: command that reads prompt stdin and writes IR stdout.")
     parser.add_argument("--llm-config", "--config", dest="llm_config", type=Path, help="YAML/JSON config with optional llm: section.")
@@ -659,6 +714,7 @@ def main() -> int:
     modes = parse_modes(args.modes)
     template = args.template.read_text(encoding="utf-8")
     recommendations = load_recommendations(args.recommendations_jsonl)
+    args.intrinsic_declarations = load_intrinsic_declarations(args.intrinsic_declarations_json)
     selected = select_tasks(load_jsonl(args.manifest), args.kernels, args.offset, args.limit)
     if not selected:
         parser.error("selected task range is empty")
@@ -774,6 +830,10 @@ def main() -> int:
         "target_cpu": args.target_cpu,
         "target_cpu_name": args.target_cpu_name,
         "target_info": str(args.out_dir / "target.json"),
+        "intrinsic_declarations": (
+            str(args.intrinsic_declarations_json) if args.intrinsic_declarations_json else None
+        ),
+        "intrinsic_declaration_count": len(args.intrinsic_declarations),
         "prompt_only": args.prompt_only,
         "records": str(records_path),
         "successes": {
