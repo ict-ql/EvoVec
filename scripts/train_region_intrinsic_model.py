@@ -302,7 +302,7 @@ def evaluate(
 
 
 DEFAULT_EXCLUDE_RECOMMENDATION_LABEL_REGEXES = (
-    r"^llvm\.vector\.(?:load|store)\.",
+    r"^(?:ir|llvm)\.vector\.(?:load|store)\.",
 )
 
 

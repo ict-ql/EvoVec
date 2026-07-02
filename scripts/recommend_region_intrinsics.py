@@ -244,7 +244,7 @@ def recommendation_entry(row: dict[str, Any], score: float, rank: int) -> dict[s
 
 
 DEFAULT_EXCLUDE_RECOMMENDATION_LABEL_REGEXES = (
-    r"^llvm\.vector\.(?:load|store)\.",
+    r"^(?:ir|llvm)\.vector\.(?:load|store)\.",
 )
 
 
@@ -353,7 +353,7 @@ def main() -> int:
     parser.add_argument(
         "--include-memory-labels",
         action="store_true",
-        help="Include generic llvm.vector.load/store labels in recommendation ranking.",
+        help="Include generic ir.vector.load/store labels in recommendation ranking.",
     )
     parser.add_argument(
         "--exclude-label-regex",

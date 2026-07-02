@@ -327,6 +327,7 @@ def load_intrinsic_declarations(path: Path | None) -> dict[str, str]:
 
 
 VECTOR_TYPE_RE = re.compile(r"^v(?P<lanes>\d+)(?:x)?(?P<elem>[A-Za-z0-9]+)$")
+VECTOR_OP_HINT_RE = re.compile(r"^(?:ir|llvm)\.vector\.(?P<opcode>[a-z0-9_]+)\.v(?P<lanes>\d+)x(?P<elem>.+)$")
 LLVM_INTRINSIC_ALIASES = {
     "_tile_dpbssd": "llvm.x86.tdpbssd.internal",
     "_tile_dpbusd": "llvm.x86.tdpbusd.internal",
@@ -335,11 +336,18 @@ LLVM_INTRINSIC_ALIASES = {
 }
 
 
+def normalize_hint_name(text: str) -> str:
+    text = LLVM_INTRINSIC_ALIASES.get(text, text)
+    if text.startswith("llvm.vector.") and not text.startswith("llvm.vector.reduce."):
+        return "ir.vector." + text.removeprefix("llvm.vector.")
+    return text
+
+
 def hint_text(item: dict[str, Any]) -> str:
     intrinsic = str(item.get("intrinsic") or "").strip()
     label = str(item.get("label") or "").strip()
     text = intrinsic or label
-    return LLVM_INTRINSIC_ALIASES.get(text, text)
+    return normalize_hint_name(text)
 
 
 def vector_hint_key(text: str) -> tuple[str, str] | None:
@@ -363,6 +371,15 @@ def vector_hint_width(text: str) -> int:
         if (match := VECTOR_TYPE_RE.fullmatch(part))
     ]
     return max(widths) if widths else 0
+
+
+def vector_op_ir_syntax(text: str) -> str | None:
+    match = VECTOR_OP_HINT_RE.fullmatch(text)
+    if not match:
+        return None
+    if text.startswith("llvm.vector.reduce."):
+        return None
+    return f"{match.group('opcode')} <{match.group('lanes')} x {match.group('elem')}>"
 
 
 def compact_hint_texts(rows: list[dict[str, Any]], max_regions: int, top_k: int) -> list[str]:
@@ -407,7 +424,9 @@ def format_recommendations(
     hints = compact_hint_texts(rows, max_regions, top_k)
     if not hints:
         return ""
-    has_declarations = any(intrinsic_declarations.get(hint) for hint in hints)
+    vector_ops = [(hint, syntax) for hint in hints if (syntax := vector_op_ir_syntax(hint))]
+    intrinsic_hints = [(hint, intrinsic_declarations.get(hint, "")) for hint in hints if not vector_op_ir_syntax(hint)]
+    has_declarations = any(declaration for _hint, declaration in intrinsic_hints)
     lines = [
         "Retriever-proposed vectorization hints:",
         "- Treat these as optional optimization hints, not mandatory rewrites.",
@@ -418,9 +437,13 @@ def format_recommendations(
             "- Exact declarations are generated from LLVM; if you use one of these intrinsics, "
             "match its declaration and call operand order exactly."
         )
-    lines.append("- Candidate operations/intrinsics:")
-    for hint in hints:
-        declaration = intrinsic_declarations.get(hint, "")
+    if vector_ops:
+        lines.append("- Ordinary LLVM IR vector operations:")
+        for _hint, syntax in vector_ops:
+            lines.append(f"  - {syntax}")
+    if intrinsic_hints:
+        lines.append("- LLVM intrinsic hints:")
+    for hint, declaration in intrinsic_hints:
         lines.append(f"  - {hint}")
         if declaration:
             lines.append(f"    exact LLVM declaration: {declaration}")

@@ -5,6 +5,7 @@ import argparse
 import json
 from pathlib import Path
 import os
+import platform
 import re
 import shlex
 import shutil
@@ -81,7 +82,10 @@ def parse_td_intrinsics(paths: list[Path]) -> dict[str, str]:
 
 def normalize_hint_name(text: str) -> str:
     text = text.strip()
-    return LLVM_INTRINSIC_ALIASES.get(text, text)
+    text = LLVM_INTRINSIC_ALIASES.get(text, text)
+    if text.startswith("llvm.vector.") and not text.startswith("llvm.vector.reduce."):
+        return "ir.vector." + text.removeprefix("llvm.vector.")
+    return text
 
 
 def hint_text(item: dict[str, Any]) -> str:
@@ -183,6 +187,52 @@ def llvm_config_args(llvm_config: str, args: list[str]) -> list[str]:
     return shlex.split(str(result["stdout"]))
 
 
+def find_versioned_system_library(name: str) -> str | None:
+    machine = platform.machine().lower()
+    incompatible_parts: set[str] = set()
+    if machine in {"x86_64", "amd64"}:
+        incompatible_parts.update({"i386-linux-gnu", "i686-linux-gnu"})
+    search_roots = [
+        Path("/usr/lib"),
+        Path("/usr/lib64"),
+        Path("/usr/local/lib"),
+        Path("/lib"),
+        Path("/lib64"),
+    ]
+    matches: list[Path] = []
+    for root in search_roots:
+        if root.exists():
+            matches.extend(root.glob(f"**/lib{name}.so*"))
+            matches.extend(root.glob(f"**/lib{name}.a"))
+    existing = sorted(
+        {
+            path.resolve()
+            for path in matches
+            if path.exists() and not incompatible_parts.intersection(path.parts)
+        },
+        key=lambda path: str(path),
+    )
+    for path in existing:
+        if path.name == f"lib{name}.so" or path.name == f"lib{name}.a":
+            return str(path)
+    for path in existing:
+        if re.fullmatch(rf"lib{re.escape(name)}\.so(?:\.\d+)+", path.name):
+            return str(path)
+    return None
+
+
+def resolve_system_lib_args(args: list[str]) -> list[str]:
+    versioned_fallback_libs = {"zstd"}
+    resolved: list[str] = []
+    for arg in args:
+        if arg.startswith("-l") and len(arg) > 2 and arg[2:] in versioned_fallback_libs:
+            library = find_versioned_system_library(arg[2:])
+            resolved.append(library or arg)
+        else:
+            resolved.append(arg)
+    return resolved
+
+
 def cpp_string(text: str) -> str:
     return json.dumps(text)
 
@@ -205,6 +255,9 @@ def helper_source(entries: dict[str, str]) -> str:
 #include "llvm/IR/Function.h"
 #include "llvm/IR/IntrinsicInst.h"
 #include "llvm/IR/Intrinsics.h"
+#if __has_include("llvm/IR/IntrinsicsX86.h")
+#include "llvm/IR/IntrinsicsX86.h"
+#endif
 #include "llvm/IR/LLVMContext.h"
 #include "llvm/IR/Module.h"
 #include "llvm/Support/raw_ostream.h"
@@ -380,7 +433,7 @@ def compile_helper(
     cxxflags = llvm_config_args(llvm_config, ["--cxxflags"])
     ldflags = llvm_config_args(llvm_config, ["--ldflags"])
     libs = llvm_config_args(llvm_config, ["--libs", "core"])
-    system_libs = llvm_config_args(llvm_config, ["--system-libs"])
+    system_libs = resolve_system_lib_args(llvm_config_args(llvm_config, ["--system-libs"]))
     cmd = [cxx, *cxxflags, str(source), "-o", str(binary), *ldflags, *libs, *system_libs]
     result = run_cmd(cmd, timeout=timeout)
     if not result["ok"]:

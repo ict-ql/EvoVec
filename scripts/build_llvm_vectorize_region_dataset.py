@@ -176,7 +176,7 @@ BINARY_VECTOR_OP_SYMBOLS = {
 }
 
 DEFAULT_EXCLUDE_TARGET_LABEL_REGEXES = (
-    r"^llvm\.vector\.(?:load|store)\.",
+    r"^(?:ir|llvm)\.vector\.(?:load|store)\.",
 )
 
 
@@ -323,7 +323,7 @@ def extract_vector_operation_counts(ir: str) -> Counter[str]:
         opcode = instruction_opcode_from_line(line)
         if opcode not in VECTOR_OPS:
             continue
-        counts[f"llvm.vector.{opcode}.{data_type}"] += 1
+        counts[f"ir.vector.{opcode}.{data_type}"] += 1
     return counts
 
 
@@ -622,7 +622,7 @@ def split_prefixes(values: list[str] | None) -> tuple[str, ...]:
 
 
 def vector_label_spec(label: str) -> dict[str, Any] | None:
-    match = re.fullmatch(r"llvm\.vector\.([a-z0-9_]+)\.(v\d+x.+)", label)
+    match = re.fullmatch(r"ir\.vector\.([a-z0-9_]+)\.(v\d+x.+)", label)
     if not match:
         return None
     opcode = match.group(1)
@@ -630,6 +630,7 @@ def vector_label_spec(label: str) -> dict[str, Any] | None:
     lane_match = re.match(r"v(\d+)x(.+)", data_type)
     if not lane_match:
         return None
+    ir_type = vector_ir_type_syntax(data_type)
     lanes = int(lane_match.group(1))
     end = max(0, lanes - 1)
     operands = [{"name": "dst", "role": "dst", "type": data_type}]
@@ -692,14 +693,21 @@ def vector_label_spec(label: str) -> dict[str, Any] | None:
         "label": label,
         "architecture": "llvm-ir",
         "extension": "vector-ir",
-        "intrinsic": label,
-        "instruction": f"{opcode} {data_type}",
+        "intrinsic": "",
+        "instruction": f"{opcode} {ir_type}",
         "cpuid": [],
         "operands": operands,
         "operation": operation,
         "split": "train",
         "source": "synthetic-vector-ir",
     }
+
+
+def vector_ir_type_syntax(data_type: str) -> str:
+    lane_match = re.fullmatch(r"v(\d+)x(.+)", data_type)
+    if not lane_match:
+        return data_type
+    return f"<{lane_match.group(1)} x {lane_match.group(2)}>"
 
 
 def llvm_label_type_token(token: str) -> str:
@@ -803,10 +811,10 @@ def reduction_label_spec(label: str) -> dict[str, Any] | None:
 
 
 def fallback_llvm_intrinsic_spec(label: str) -> dict[str, Any] | None:
-    if not label.startswith("llvm."):
-        return None
     if spec := vector_label_spec(label):
         return spec
+    if not label.startswith("llvm."):
+        return None
     if spec := reduction_label_spec(label):
         return spec
     type_parts = llvm_label_type_parts(label)
@@ -896,7 +904,7 @@ def main() -> int:
     parser.add_argument(
         "--keep-memory-target-labels",
         action="store_true",
-        help="Keep generic llvm.vector.load/store labels as supervised targets.",
+        help="Keep generic ir.vector.load/store labels as supervised targets.",
     )
     parser.add_argument(
         "--exclude-target-label-regex",
