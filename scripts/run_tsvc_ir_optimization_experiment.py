@@ -292,32 +292,41 @@ def load_recommendations(path: Path | None) -> dict[str, list[dict[str, Any]]]:
     return grouped
 
 
+def clean_intrinsic_declaration(text: str) -> str:
+    for line in text.splitlines():
+        stripped = line.strip()
+        if not stripped.startswith("declare "):
+            continue
+        return re.sub(r"\s+#\d+\s*$", "", stripped)
+    return " ".join(text.split())
+
+
 def load_intrinsic_declarations(path: Path | None) -> dict[str, str]:
     if path is None:
         return {}
     if path.suffix.lower() == ".jsonl":
         rows = load_jsonl(path)
         return {
-            str(row["name"]): str(row["declaration"]).strip()
+            str(row["name"]): clean_intrinsic_declaration(str(row["declaration"]))
             for row in rows
             if row.get("name") and str(row.get("declaration", "")).strip()
         }
     data = json.loads(path.read_text(encoding="utf-8"))
     if isinstance(data, dict) and isinstance(data.get("declarations"), dict):
         return {
-            str(name): str(declaration).strip()
+            str(name): clean_intrinsic_declaration(str(declaration))
             for name, declaration in data["declarations"].items()
             if str(declaration).strip()
         }
     if isinstance(data, dict):
         return {
-            str(name): str(declaration).strip()
+            str(name): clean_intrinsic_declaration(str(declaration))
             for name, declaration in data.items()
             if isinstance(declaration, str) and declaration.strip()
         }
     if isinstance(data, list):
         return {
-            str(row["name"]): str(row["declaration"]).strip()
+            str(row["name"]): clean_intrinsic_declaration(str(row["declaration"]))
             for row in data
             if isinstance(row, dict)
             and row.get("name")
@@ -425,7 +434,11 @@ def format_recommendations(
     if not hints:
         return ""
     vector_ops = [(hint, syntax) for hint in hints if (syntax := vector_op_ir_syntax(hint))]
-    intrinsic_hints = [(hint, intrinsic_declarations.get(hint, "")) for hint in hints if not vector_op_ir_syntax(hint)]
+    intrinsic_hints = [
+        (hint, clean_intrinsic_declaration(intrinsic_declarations.get(hint, "")))
+        for hint in hints
+        if not vector_op_ir_syntax(hint)
+    ]
     has_declarations = any(declaration for _hint, declaration in intrinsic_hints)
     lines = [
         "Retriever-proposed vectorization hints:",
