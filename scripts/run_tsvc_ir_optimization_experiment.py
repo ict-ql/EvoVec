@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import math
 from pathlib import Path
@@ -107,6 +108,24 @@ def strip_markdown_fence(text: str) -> str:
     if lines and lines[-1].startswith("```"):
         lines = lines[:-1]
     return "\n".join(lines).strip() + "\n"
+
+
+def write_jsonl(path: Path, rows: list[dict[str, Any]]) -> None:
+    with path.open("w", encoding="utf-8") as file:
+        for row in rows:
+            file.write(json.dumps(row, sort_keys=True) + "\n")
+
+
+def successful_existing_generation(llm_path: Path, candidate_ir_path: Path) -> dict[str, Any] | None:
+    if not llm_path.exists() or not candidate_ir_path.exists() or candidate_ir_path.stat().st_size == 0:
+        return None
+    try:
+        llm_result = json.loads(llm_path.read_text(encoding="utf-8"))
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(llm_result, dict) or not llm_result.get("ok"):
+        return None
+    return llm_result
 
 
 def select_tasks(tasks: list[dict[str, Any]], kernels: str, offset: int, limit: int) -> list[tuple[int, dict[str, Any]]]:
@@ -534,7 +553,7 @@ def run_mode(
     template: str,
     scalar_ir: str,
     recommendation_rows: list[dict[str, Any]],
-    expected_checksum: float,
+    expected_checksum: float | None,
     reference_time: float | None,
     scalar_time: float | None,
 ) -> dict[str, Any]:
@@ -580,18 +599,45 @@ def run_mode(
         record["prompt_only"] = True
         return record
 
-    llm_result = call_llm(args, prompt)
-    llm_path.write_text(json.dumps(llm_result, indent=2), encoding="utf-8")
+    existing_llm_result = (
+        successful_existing_generation(llm_path, candidate_ir_path) if args.skip_existing else None
+    )
+    if existing_llm_result is not None:
+        llm_result = existing_llm_result
+        record["skipped_existing_generation"] = True
+    else:
+        llm_result = call_llm(args, prompt)
+        llm_path.write_text(json.dumps(llm_result, indent=2), encoding="utf-8")
     record["llm_ok"] = llm_result["ok"]
-    record["llm_elapsed_sec"] = llm_result["elapsed_sec"]
+    record["llm_elapsed_sec"] = llm_result.get("elapsed_sec")
     if not llm_result["ok"]:
         record["ok"] = False
         record["error"] = llm_result.get("error") or llm_result.get("stderr")
         return record
 
-    candidate_ir = strip_markdown_fence(str(llm_result["stdout"]))
-    candidate_ir_path.write_text(candidate_ir, encoding="utf-8")
+    if existing_llm_result is None:
+        candidate_ir = strip_markdown_fence(str(llm_result["stdout"]))
+        candidate_ir_path.write_text(candidate_ir, encoding="utf-8")
     attr_patch = patch_target_attributes_if_enabled(args, candidate_ir_path)
+    if existing_llm_result is not None:
+        attr_patch["skipped_existing_generation"] = True
+
+    if args.generate_only:
+        record.update(
+            {
+                "ok": True,
+                "generated_only": True,
+                "verify_skipped": True,
+                "target_attribute_patch": attr_patch,
+            }
+        )
+        return record
+
+    if expected_checksum is None:
+        record["ok"] = False
+        record["error"] = "verification requires expected checksum"
+        return record
+
     verify_result = build_and_run_ir(args, task, candidate_ir_path, mode_dir / "candidate", expected_checksum)
     verify_path.write_text(json.dumps(verify_result, indent=2), encoding="utf-8")
     parsed = verify_result.get("parsed") or {}
@@ -697,10 +743,25 @@ def main() -> int:
     parser.add_argument("--run-timeout", type=int, default=60)
     parser.add_argument("--agent-timeout", type=int, default=900)
     parser.add_argument("--prompt-only", action="store_true")
+    parser.add_argument(
+        "--generate-only",
+        action="store_true",
+        help="Call the LLM and write candidate IR, but skip candidate compile/run verification.",
+    )
+    parser.add_argument(
+        "--skip-existing",
+        action="store_true",
+        help="Reuse existing successful llm.json + candidate.ll outputs instead of calling the LLM again.",
+    )
+    parser.add_argument("--jobs", type=int, default=1, help="Number of mode jobs to run concurrently.")
     args = parser.parse_args()
 
     if args.limit < 0:
         args.limit = 0
+    if args.jobs <= 0:
+        parser.error("--jobs must be positive")
+    if args.prompt_only and args.generate_only:
+        parser.error("--prompt-only and --generate-only are mutually exclusive")
     if args.offset < 0:
         parser.error("--offset must be non-negative")
     if args.max_recommendation_regions <= 0:
@@ -762,6 +823,8 @@ def main() -> int:
     records_path = args.out_dir / "records.jsonl"
     records_path.write_text("", encoding="utf-8")
     records: list[dict[str, Any]] = []
+    work_items: list[dict[str, Any]] = []
+    needs_verification = not args.prompt_only and not args.generate_only
 
     for task_index, task in selected:
         kernel = str(task["kernel"])
@@ -780,8 +843,7 @@ def main() -> int:
                 "scalar_ir_emit": ir_result,
             }
             records.append(record)
-            with records_path.open("a", encoding="utf-8") as file:
-                file.write(json.dumps(record, sort_keys=True) + "\n")
+            write_jsonl(records_path, records)
             print(json.dumps({"task_index": task_index, "kernel": kernel, "ok": False, "error": record["error"]}), flush=True)
             continue
         scalar_attr_patch = patch_target_attributes_if_enabled(args, scalar_ir_path)
@@ -790,28 +852,34 @@ def main() -> int:
             encoding="utf-8",
         )
 
-        reference = build_reference(args, task, task_dir / "reference")
-        (task_dir / "reference.json").write_text(json.dumps(reference, indent=2), encoding="utf-8")
-        if not reference["ok"]:
-            record = {
-                "task_index": task_index,
-                "kernel": kernel,
-                "ok": False,
-                "error": "reference build/run failed",
-                "reference": reference,
-            }
-            records.append(record)
-            with records_path.open("a", encoding="utf-8") as file:
-                file.write(json.dumps(record, sort_keys=True) + "\n")
-            print(json.dumps({"task_index": task_index, "kernel": kernel, "ok": False, "error": record["error"]}), flush=True)
-            continue
+        expected_checksum: float | None = None
+        reference_time: float | None = None
+        scalar_time: float | None = None
+        if needs_verification:
+            reference = build_reference(args, task, task_dir / "reference")
+            (task_dir / "reference.json").write_text(json.dumps(reference, indent=2), encoding="utf-8")
+            if not reference["ok"]:
+                record = {
+                    "task_index": task_index,
+                    "kernel": kernel,
+                    "ok": False,
+                    "error": "reference build/run failed",
+                    "reference": reference,
+                }
+                records.append(record)
+                write_jsonl(records_path, records)
+                print(
+                    json.dumps({"task_index": task_index, "kernel": kernel, "ok": False, "error": record["error"]}),
+                    flush=True,
+                )
+                continue
 
-        expected_checksum = float(reference["parsed"]["checksum"])
-        reference_time = float(reference["parsed"]["time_sec"])
-        scalar_eval = build_and_run_ir(args, task, scalar_ir_path, task_dir / "scalar_ir", expected_checksum)
-        (task_dir / "scalar_ir.json").write_text(json.dumps(scalar_eval, indent=2), encoding="utf-8")
-        scalar_parsed = scalar_eval.get("parsed") or {}
-        scalar_time = float(scalar_parsed["time_sec"]) if scalar_eval["ok"] and scalar_parsed.get("time_sec") else None
+            expected_checksum = float(reference["parsed"]["checksum"])
+            reference_time = float(reference["parsed"]["time_sec"])
+            scalar_eval = build_and_run_ir(args, task, scalar_ir_path, task_dir / "scalar_ir", expected_checksum)
+            (task_dir / "scalar_ir.json").write_text(json.dumps(scalar_eval, indent=2), encoding="utf-8")
+            scalar_parsed = scalar_eval.get("parsed") or {}
+            scalar_time = float(scalar_parsed["time_sec"]) if scalar_eval["ok"] and scalar_parsed.get("time_sec") else None
         scalar_ir = scalar_ir_path.read_text(encoding="utf-8", errors="replace")
         recommendation_rows = recommendations.get(kernel, [])
 
@@ -827,38 +895,76 @@ def main() -> int:
             "modes": {},
             "ok": False,
         }
-        for mode in modes:
-            mode_record = run_mode(
-                args,
-                mode=mode,
-                task=task,
-                task_dir=task_dir,
-                template=template,
-                scalar_ir=scalar_ir,
-                recommendation_rows=recommendation_rows,
-                expected_checksum=expected_checksum,
-                reference_time=reference_time,
-                scalar_time=scalar_time,
-            )
-            record["modes"][mode] = mode_record
-            print(
-                json.dumps(
-                    {
-                        "task_index": task_index,
-                        "kernel": kernel,
-                        "mode": mode,
-                        "ok": mode_record.get("ok", False),
-                        "time_sec": mode_record.get("observed_time_sec"),
-                        "speedup_vs_scalar_ir": mode_record.get("speedup_vs_scalar_ir"),
-                    },
-                    sort_keys=True,
-                ),
-                flush=True,
-            )
-        record["ok"] = any(mode_record.get("ok") for mode_record in record["modes"].values())
         records.append(record)
-        with records_path.open("a", encoding="utf-8") as file:
-            file.write(json.dumps(record, sort_keys=True) + "\n")
+        for mode in modes:
+            work_items.append(
+                {
+                    "record": record,
+                    "task_index": task_index,
+                    "kernel": kernel,
+                    "mode": mode,
+                    "task": task,
+                    "task_dir": task_dir,
+                    "template": template,
+                    "scalar_ir": scalar_ir,
+                    "recommendation_rows": recommendation_rows,
+                    "expected_checksum": expected_checksum,
+                    "reference_time": reference_time,
+                    "scalar_time": scalar_time,
+                }
+            )
+        write_jsonl(records_path, records)
+
+    if work_items:
+        with ThreadPoolExecutor(max_workers=args.jobs) as executor:
+            future_to_item = {
+                executor.submit(
+                    run_mode,
+                    args,
+                    mode=item["mode"],
+                    task=item["task"],
+                    task_dir=item["task_dir"],
+                    template=item["template"],
+                    scalar_ir=item["scalar_ir"],
+                    recommendation_rows=item["recommendation_rows"],
+                    expected_checksum=item["expected_checksum"],
+                    reference_time=item["reference_time"],
+                    scalar_time=item["scalar_time"],
+                ): item
+                for item in work_items
+            }
+            for future in as_completed(future_to_item):
+                item = future_to_item[future]
+                mode = str(item["mode"])
+                record = item["record"]
+                try:
+                    mode_record = future.result()
+                except Exception as exc:  # noqa: BLE001 - keep batch generation moving.
+                    mode_record = {
+                        "mode": mode,
+                        "ok": False,
+                        "error": str(exc),
+                        "exception_type": type(exc).__name__,
+                    }
+                record["modes"][mode] = mode_record
+                record["ok"] = any(mode_record.get("ok") for mode_record in record["modes"].values())
+                write_jsonl(records_path, records)
+                print(
+                    json.dumps(
+                        {
+                            "task_index": item["task_index"],
+                            "kernel": item["kernel"],
+                            "mode": mode,
+                            "ok": mode_record.get("ok", False),
+                            "time_sec": mode_record.get("observed_time_sec"),
+                            "speedup_vs_scalar_ir": mode_record.get("speedup_vs_scalar_ir"),
+                            "generated_only": mode_record.get("generated_only", False),
+                            "skipped_existing_generation": mode_record.get("skipped_existing_generation", False),
+                        },
+                        sort_keys=True,
+                    ),
+                    flush=True,
+                )
 
     summary: dict[str, Any] = {
         "tasks": len(records),
@@ -872,6 +978,9 @@ def main() -> int:
         ),
         "intrinsic_declaration_count": len(args.intrinsic_declarations),
         "prompt_only": args.prompt_only,
+        "generate_only": args.generate_only,
+        "skip_existing": args.skip_existing,
+        "jobs": args.jobs,
         "records": str(records_path),
         "successes": {
             mode: sum(1 for record in records if record.get("modes", {}).get(mode, {}).get("ok"))
@@ -891,7 +1000,12 @@ def main() -> int:
         for record in records:
             baseline = record.get("modes", {}).get("baseline", {})
             guided = record.get("modes", {}).get("guided", {})
-            if baseline.get("ok") and guided.get("ok"):
+            if (
+                baseline.get("ok")
+                and guided.get("ok")
+                and baseline.get("observed_time_sec") is not None
+                and guided.get("observed_time_sec") is not None
+            ):
                 baseline_time = float(baseline["observed_time_sec"])
                 guided_time = float(guided["observed_time_sec"])
                 if guided_time > 0.0:
