@@ -457,9 +457,10 @@ def format_recommendations(
     if intrinsic_hints:
         lines.append("- LLVM intrinsic hints:")
     for hint, declaration in intrinsic_hints:
-        lines.append(f"  - {hint}")
         if declaration:
-            lines.append(f"    exact LLVM declaration: {declaration}")
+            lines.append(f"  - {declaration}")
+        else:
+            lines.append(f"  - {hint}")
     return "\n".join(lines)
 
 
