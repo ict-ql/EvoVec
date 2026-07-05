@@ -308,6 +308,9 @@ python3 scripts/run_tsvc_ir_optimization_experiment.py \
 The exact prompts, model outputs, compile/run logs, and per-kernel records are
 written under the output directory. `summary.json` reports success counts, mean
 times, and paired guided-vs-baseline speedup when both modes pass correctness.
+For post-generation verification runs that should avoid the slow scalar IR
+performance baseline, pass `--skip-scalar-ir-eval`; candidate correctness and
+runtime are still measured, but `speedup_vs_scalar_ir` is left unset.
 The runner records target details in `target.json`. It first asks
 `clang -march=native -###` for the LLVM target CPU, then falls back to
 `gcc -Q --help=target -march=native` and CPU-model heuristics when clang reports

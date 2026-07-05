@@ -736,6 +736,11 @@ def main() -> int:
     parser.add_argument("--scalar-opt-level", default="3", choices=["0", "1", "2", "3", "s", "z"])
     parser.add_argument("--extra-clang-arg", action="append", default=[])
     parser.add_argument("--skip-existing-ir", action="store_true")
+    parser.add_argument(
+        "--skip-scalar-ir-eval",
+        action="store_true",
+        help="Skip compiling/running the scalar IR performance baseline during verification.",
+    )
     parser.add_argument("--max-recommendation-regions", type=int, default=8)
     parser.add_argument("--recommendation-top-k", type=int, default=20)
     parser.add_argument("--checksum-atol", type=float, default=1e-3)
@@ -876,7 +881,16 @@ def main() -> int:
 
             expected_checksum = float(reference["parsed"]["checksum"])
             reference_time = float(reference["parsed"]["time_sec"])
-            scalar_eval = build_and_run_ir(args, task, scalar_ir_path, task_dir / "scalar_ir", expected_checksum)
+            if args.skip_scalar_ir_eval:
+                scalar_eval = {
+                    "ok": False,
+                    "skipped": True,
+                    "reason": "--skip-scalar-ir-eval",
+                    "ir_file": str(scalar_ir_path),
+                    "expected_checksum": expected_checksum,
+                }
+            else:
+                scalar_eval = build_and_run_ir(args, task, scalar_ir_path, task_dir / "scalar_ir", expected_checksum)
             (task_dir / "scalar_ir.json").write_text(json.dumps(scalar_eval, indent=2), encoding="utf-8")
             scalar_parsed = scalar_eval.get("parsed") or {}
             scalar_time = float(scalar_parsed["time_sec"]) if scalar_eval["ok"] and scalar_parsed.get("time_sec") else None
@@ -980,6 +994,7 @@ def main() -> int:
         "prompt_only": args.prompt_only,
         "generate_only": args.generate_only,
         "skip_existing": args.skip_existing,
+        "skip_scalar_ir_eval": args.skip_scalar_ir_eval,
         "jobs": args.jobs,
         "records": str(records_path),
         "successes": {
