@@ -292,6 +292,14 @@ def patch_target_attributes_if_enabled(args: argparse.Namespace, ir_path: Path) 
     return patch_ir_file(ir_path, args.target_attributes)
 
 
+def postprocess_ir_if_enabled(args: argparse.Namespace, ir_path: Path) -> dict[str, Any]:
+    if args.no_ir_postprocess:
+        return {"changed": False, "disabled": True, "path": str(ir_path)}
+    from neural_asm_pipeline.ir_postprocess import postprocess_ir_file
+
+    return postprocess_ir_file(ir_path)
+
+
 def recommendation_key(row: dict[str, Any]) -> str:
     function_name = str(row.get("function_name", "")).strip()
     if function_name:
@@ -583,6 +591,7 @@ def run_mode(
     prompt_path = mode_dir / "prompt.txt"
     llm_path = mode_dir / "llm.json"
     candidate_ir_path = mode_dir / "candidate.ll"
+    postprocess_path = mode_dir / "postprocess.json"
     verify_path = mode_dir / "verify.json"
     prompt_path.write_text(prompt, encoding="utf-8")
 
@@ -591,6 +600,7 @@ def run_mode(
         "prompt_path": str(prompt_path),
         "llm_path": str(llm_path),
         "candidate_ir": str(candidate_ir_path),
+        "postprocess_path": str(postprocess_path),
         "verify_path": str(verify_path),
         "recommendation_regions": len(recommendation_rows) if mode != "baseline" else 0,
     }
@@ -618,6 +628,8 @@ def run_mode(
     if existing_llm_result is None:
         candidate_ir = strip_markdown_fence(str(llm_result["stdout"]))
         candidate_ir_path.write_text(candidate_ir, encoding="utf-8")
+    postprocess_summary = postprocess_ir_if_enabled(args, candidate_ir_path)
+    postprocess_path.write_text(json.dumps(postprocess_summary, indent=2), encoding="utf-8")
     attr_patch = patch_target_attributes_if_enabled(args, candidate_ir_path)
     if existing_llm_result is not None:
         attr_patch["skipped_existing_generation"] = True
@@ -628,6 +640,7 @@ def run_mode(
                 "ok": True,
                 "generated_only": True,
                 "verify_skipped": True,
+                "ir_postprocess": postprocess_summary,
                 "target_attribute_patch": attr_patch,
             }
         )
@@ -648,6 +661,7 @@ def run_mode(
             "compile_ok": verify_result["compile"]["ok"],
             "run_ok": bool(verify_result.get("run") and verify_result["run"]["ok"]),
             "checksum_ok": verify_result["checksum_ok"],
+            "ir_postprocess": postprocess_summary,
             "target_attribute_patch": attr_patch,
             "observed_checksum": parsed.get("checksum"),
             "observed_time_sec": observed_time,
@@ -730,6 +744,11 @@ def main() -> int:
         "--no-target-attributes",
         action="store_true",
         help="Do not inject target-cpu/target-features attributes into scalar or generated IR.",
+    )
+    parser.add_argument(
+        "--no-ir-postprocess",
+        action="store_true",
+        help="Disable text post-processing of LLM-generated candidate IR before verification.",
     )
     parser.add_argument("--cc", default="cc")
     parser.add_argument("--clang", default="clang")
@@ -994,6 +1013,7 @@ def main() -> int:
         "prompt_only": args.prompt_only,
         "generate_only": args.generate_only,
         "skip_existing": args.skip_existing,
+        "ir_postprocess": not args.no_ir_postprocess,
         "skip_scalar_ir_eval": args.skip_scalar_ir_eval,
         "jobs": args.jobs,
         "records": str(records_path),

@@ -308,6 +308,10 @@ python3 scripts/run_tsvc_ir_optimization_experiment.py \
 The exact prompts, model outputs, compile/run logs, and per-kernel records are
 written under the output directory. `summary.json` reports success counts, mean
 times, and paired guided-vs-baseline speedup when both modes pass correctness.
+Generated candidate IR is post-processed before verification to repair common
+LLM syntax issues such as redundant vector operand types, opaque-pointer
+bitcasts, and SSA-assigned constants. Each mode writes `postprocess.json` with
+the applied transforms; pass `--no-ir-postprocess` for ablations.
 For post-generation verification runs that should avoid the slow scalar IR
 performance baseline, pass `--skip-scalar-ir-eval`; candidate correctness and
 runtime are still measured, but `speedup_vs_scalar_ir` is left unset.
