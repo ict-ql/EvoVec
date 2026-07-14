@@ -3,14 +3,37 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <time.h>
+#if defined(__linux__) && defined(__x86_64__)
+#include <errno.h>
+#include <string.h>
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
 #if defined(_WIN32)
 #include <windows.h>
 #endif
 
-#define GEMM_M 16
-#define GEMM_N 16
-#define GEMM_K 64
+#define GEMM_M 160
+#define GEMM_N 160
+#define GEMM_K 640
 #define DEFAULT_ITERS 100000
+
+#if defined(__linux__) && defined(__x86_64__)
+#ifndef ARCH_REQ_XCOMP_PERM
+#define ARCH_REQ_XCOMP_PERM 0x1023
+#endif
+#ifndef XFEATURE_XTILEDATA
+#define XFEATURE_XTILEDATA 18
+#endif
+#endif
+
+#if defined(__clang__) || defined(__GNUC__)
+#define ALIGN64 __attribute__((aligned(64)))
+#elif defined(_MSC_VER)
+#define ALIGN64 __declspec(align(64))
+#else
+#define ALIGN64
+#endif
 
 void gemm_i8_i32_16x16x64(
     int32_t c[GEMM_M][GEMM_N],
@@ -49,6 +72,20 @@ static long parse_iters(int argc, char **argv) {
   return value;
 }
 
+static void request_amx_permission(void) {
+#if defined(__linux__) && defined(__x86_64__)
+  long rc = syscall(SYS_arch_prctl, ARCH_REQ_XCOMP_PERM, XFEATURE_XTILEDATA);
+  if (rc != 0) {
+    fprintf(stderr,
+            "AMX XTILEDATA permission failed: errno=%d (%s)\n",
+            errno,
+            strerror(errno));
+    exit(2);
+  }
+  fprintf(stderr, "AMX XTILEDATA permission OK\n");
+#endif
+}
+
 static void init_inputs(
     int32_t c[GEMM_M][GEMM_N],
     int8_t a[GEMM_M][GEMM_K],
@@ -81,11 +118,12 @@ static int64_t checksum_matrix(const int32_t c[GEMM_M][GEMM_N]) {
 }
 
 int main(int argc, char **argv) {
-  static int32_t c[GEMM_M][GEMM_N];
-  static int8_t a[GEMM_M][GEMM_K];
-  static int8_t b[GEMM_K][GEMM_N];
+  static ALIGN64 int32_t c[GEMM_M][GEMM_N];
+  static ALIGN64 int8_t a[GEMM_M][GEMM_K];
+  static ALIGN64 int8_t b[GEMM_K][GEMM_N];
 
   const long iters = parse_iters(argc, argv);
+  request_amx_permission();
   init_inputs(c, a, b);
 
   const double start = now_seconds();
