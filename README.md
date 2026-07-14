@@ -328,6 +328,45 @@ The same LLM client is available directly as `python3 scripts/ask_llm.py`, which
 reads from stdin, `-p`, or `--file` and uses the same config format. Keep API
 keys out of git; set `OPENAI_API_KEY` or pass a private config file.
 
+For a single source file or LLVM IR file, use the one-program wrapper. It emits
+or copies pre-vectorization IR, runs region-intrinsic recommendation, writes a
+one-row `suite=single` manifest, and then calls the same baseline/guided IR
+generation runner. Since an arbitrary program has no TSVC checksum harness, the
+wrapper defaults to generation-only:
+
+```bash
+python3 scripts/run_single_program_ir_optimization_pipeline.py \
+  --program examples/gemm/gemm_scalar.c \
+  --checkpoint /home/amax/ql/SRC/ComAgent/runs/llvm_vectorize_regions/models/x86_v1/amx_probe_candidates/epoch_0080_rank_03_hits_002.pt \
+  --instruction-graph-dir /home/amax/ql/SRC/ComAgent/runs/llvm_vectorize_regions/x86_v1/instruction_graphs_with_amx \
+  --llvm-project-root /path/to/llvm-project \
+  --out-dir runs/single_ir_opt/gemm_scalar \
+  --api-base-url "$OPENAI_BASE_URL" \
+  --api-key "$OPENAI_API_KEY" \
+  --model gpt-5 \
+  --max-tokens 16000 \
+  --modes baseline,guided \
+  --clang clang \
+  --cc cc \
+  --skip-existing \
+  --jobs 2
+```
+
+Outputs are grouped under the wrapper output directory:
+
+```text
+prevec_ir/<program>.ll
+recommendations/top20/recommendations.jsonl
+intrinsic_declarations/intrinsic_declarations.json
+ir_opt/gpt5_top20/{records.jsonl,summary.json,...}
+```
+
+`--llvm-project-root` is optional. When present, declarations are resolved from
+this program's recommendation file after inference. If omitted, the guided
+prompt still includes recommendation names, but not exact LLVM declarations.
+Use `--intrinsic-declarations-json` only when intentionally reusing a
+pre-resolved declarations file.
+
 For a quick AMX smoke test, emit scalar GEMM IR and run the no-AMX checkpoint
 against the inference-time instruction graph directory that contains AMX:
 

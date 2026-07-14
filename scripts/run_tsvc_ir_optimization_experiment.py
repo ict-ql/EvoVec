@@ -6,9 +6,11 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import math
+import os
 from pathlib import Path
 import re
 import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -159,6 +161,14 @@ def resolve_task_path(task: dict[str, Any], key: str, fallback: Path) -> Path:
     return fallback
 
 
+def resolve_existing_path(raw: Any) -> Path | None:
+    text = str(raw or "").strip()
+    if not text:
+        return None
+    path = Path(text)
+    return path if path.exists() else None
+
+
 def task_paths(args: argparse.Namespace, task: dict[str, Any]) -> dict[str, Path]:
     kernel = str(task["kernel"])
     root = resolve_tsvc_root(args, task)
@@ -172,10 +182,39 @@ def task_paths(args: argparse.Namespace, task: dict[str, Any]) -> dict[str, Path
 
 
 def compile_scalar_ir(args: argparse.Namespace, task: dict[str, Any], ir_path: Path) -> dict[str, Any]:
-    paths = task_paths(args, task)
     ir_path.parent.mkdir(parents=True, exist_ok=True)
+    input_ir = resolve_existing_path(task.get("ir_file"))
+    if input_ir is not None:
+        if input_ir.resolve() != ir_path.resolve():
+            shutil.copyfile(input_ir, ir_path)
+            return {"ok": True, "copied_from": str(input_ir), "ir_file": str(ir_path)}
+        return {"ok": True, "reused": True, "ir_file": str(ir_path)}
     if args.skip_existing_ir and ir_path.exists():
         return {"ok": True, "skipped": True, "ir_file": str(ir_path)}
+    if str(task.get("suite", "")).strip().lower() == "single":
+        source = resolve_existing_path(task.get("source_file")) or resolve_existing_path(task.get("reference_kernel"))
+        if source is None:
+            return {
+                "ok": False,
+                "error": "single task requires an existing ir_file or source_file/reference_kernel",
+                "task": task,
+            }
+        cmd = [
+            args.clang,
+            "-S",
+            "-emit-llvm",
+            f"-O{args.scalar_opt_level}",
+            "-fno-vectorize",
+            "-fno-slp-vectorize",
+            "-fno-unroll-loops",
+            f"-march={args.target_attr_march}",
+            *args.extra_clang_arg,
+            str(source),
+            "-o",
+            str(ir_path),
+        ]
+        return run_cmd(cmd, timeout=args.build_timeout)
+    paths = task_paths(args, task)
     cmd = [
         args.clang,
         "-S",
@@ -517,7 +556,7 @@ def render_prompt(
 
 def call_llm(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
     if args.agent_cmd:
-        return run_cmd(shlex.split(args.agent_cmd), timeout=args.agent_timeout, input_text=prompt)
+        return run_cmd(shlex.split(args.agent_cmd, posix=os.name != "nt"), timeout=args.agent_timeout, input_text=prompt)
     start = time.time()
     try:
         response = args._llm_client.call(
