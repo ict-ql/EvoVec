@@ -246,7 +246,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--api-mode", default="")
     parser.add_argument("--model", default="gpt-5")
     parser.add_argument("--max-tokens", type=int, default=16000)
-    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--modes", default="baseline,guided")
     parser.add_argument("--top-k", type=int, default=20)
     parser.add_argument("--device", default="auto")

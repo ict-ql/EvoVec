@@ -358,6 +358,22 @@ def load_recommendations(path: Path | None) -> dict[str, list[dict[str, Any]]]:
     return grouped
 
 
+def recommendations_for_task(
+    grouped: dict[str, list[dict[str, Any]]],
+    task: dict[str, Any],
+    kernel: str,
+) -> list[dict[str, Any]]:
+    rows = grouped.get(kernel, [])
+    if rows:
+        return rows
+    if str(task.get("suite", "")).strip().lower() != "single":
+        return []
+    output: list[dict[str, Any]] = []
+    for group_rows in grouped.values():
+        output.extend(group_rows)
+    return output
+
+
 def clean_intrinsic_declaration(text: str) -> str:
     for line in text.splitlines():
         stripped = line.strip()
@@ -749,7 +765,7 @@ def main() -> int:
     parser.add_argument("--api-base-url", default="", help="Override config llm.base_url / OPENAI_BASE_URL.")
     parser.add_argument("--api-key", default="", help="Override config llm.api_key / OPENAI_API_KEY.")
     parser.add_argument("--max-tokens", type=int, default=16000)
-    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--temperature", type=float, default=None)
     parser.add_argument("--truncation", default="auto")
     parser.add_argument("--store", action="store_true")
     parser.add_argument("--max-retries", type=int, default=2)
@@ -953,7 +969,7 @@ def main() -> int:
             scalar_parsed = scalar_eval.get("parsed") or {}
             scalar_time = float(scalar_parsed["time_sec"]) if scalar_eval["ok"] and scalar_parsed.get("time_sec") else None
         scalar_ir = scalar_ir_path.read_text(encoding="utf-8", errors="replace")
-        recommendation_rows = recommendations.get(kernel, [])
+        recommendation_rows = recommendations_for_task(recommendations, task, kernel)
 
         record = {
             "task_index": task_index,
