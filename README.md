@@ -324,6 +324,31 @@ The scalar IR shown to the LLM and the generated candidate IR used for
 verification are patched with the detected `"target-cpu"` and
 `"target-features"` function attributes by default, matching the native compile
 path. Pass `--no-target-attributes` only for ablations.
+
+To measure ordinary compiler baselines on the same TSVC harness, run the
+compiler-only baseline runner. It builds each kernel with GCC first, uses GCC as
+the checksum/time reference, then reports LLVM and ICX speedups as
+`gcc_time / compiler_time`:
+
+```bash
+python3 scripts/run_tsvc_compiler_baselines.py \
+  --manifest runs/manifests/tsvc_kernels.jsonl \
+  --tsvc-root runs/tsvc_kernels/v1 \
+  --out-dir runs/tsvc_compiler_baselines/native_o3 \
+  --compiler gcc=gcc \
+  --compiler llvm19=/path/to/llvm-19.1.0/bin/clang \
+  --compiler icx=icx \
+  --reference gcc \
+  --march native \
+  --opt-level 3 \
+  --limit 151 \
+  --run-timeout 300 \
+  --jobs 20
+```
+
+The output directory contains per-kernel compile/run logs plus
+`records.jsonl` and `summary.json`; the summary includes arithmetic and
+geometric means for `llvm19_vs_gcc` and `icx_vs_gcc`.
 The same LLM client is available directly as `python3 scripts/ask_llm.py`, which
 reads from stdin, `-p`, or `--file` and uses the same config format. Keep API
 keys out of git; set `OPENAI_API_KEY` or pass a private config file.
