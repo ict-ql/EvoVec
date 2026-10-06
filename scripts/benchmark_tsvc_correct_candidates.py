@@ -94,7 +94,7 @@ def compile_commands(
     ]
     commands = {
         "reference": [
-            args.gcc,
+            args.cc,
             "-O3",
             f"-march={args.march}",
             "-no-pie",
@@ -168,7 +168,7 @@ def benchmark_kernel(
         "kernel": kernel,
         "ok": all(checksum_ok.values()),
         "accepted_modes": accepted_modes,
-        "compiler": {"reference": f"{args.gcc} -O3", "baseline": args.clang, "guided": args.clang},
+        "compiler": {"reference": f"{args.cc} -O3", "baseline": args.clang, "guided": args.clang},
         "warmups": args.warmups,
         "repetitions": args.repetitions,
         "samples": samples,
@@ -223,7 +223,7 @@ def write_aggregate(args: argparse.Namespace, results: list[dict[str, Any]]) -> 
             "baseline" in result.get("accepted_modes", []) and "guided" in result.get("accepted_modes", [])
             for result in results
         ),
-        "reference": f"{args.gcc} -O3 -march={args.march}",
+        "reference": f"{args.cc} -O3 -march={args.march}",
         "candidate_compiler": f"{args.clang} -O3 -march={args.march}",
         "warmups": args.warmups,
         "repetitions": args.repetitions,
@@ -249,11 +249,11 @@ def main() -> int:
     parser.add_argument("--experiment-dir", type=Path, required=True)
     parser.add_argument("--tsvc-root", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
-    parser.add_argument("--gcc", default="gcc")
+    parser.add_argument("--cc", "--gcc", dest="cc", default="cc")
     parser.add_argument("--clang", default="clang")
     parser.add_argument("--march", default="native")
-    parser.add_argument("--warmups", type=int, default=1)
-    parser.add_argument("--repetitions", type=int, default=10)
+    parser.add_argument("--warmups", type=int, default=0)
+    parser.add_argument("--repetitions", type=int, default=1)
     parser.add_argument("--taskset-core", type=int)
     parser.add_argument("--checksum-atol", type=float, default=1e-3)
     parser.add_argument("--build-timeout", type=int, default=120)
