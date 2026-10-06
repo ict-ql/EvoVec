@@ -1632,6 +1632,8 @@ def main() -> int:
             sum(paired_speedups) / len(paired_speedups) if paired_speedups else None
         )
     (args.out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
+    if args.resume_completed:
+        write_jsonl(resume_snapshot_path, records)
     print(json.dumps(summary, indent=2))
     return 0
 
