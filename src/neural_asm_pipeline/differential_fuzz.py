@@ -410,6 +410,8 @@ def run_differential_fuzz(
     candidate_prefixed_path = out_dir / "candidate.prefixed.ll"
     harness_c_path = out_dir / "differential_fuzz_harness.c"
     harness_ir_path = out_dir / "differential_fuzz_harness.ll"
+    source_verified_path = out_dir / "reference.verified.ll"
+    candidate_verified_path = out_dir / "candidate.verified.ll"
     combined_ir_path = out_dir / "combined.ll"
     executable_path = out_dir / "differential_fuzzer"
     source_prefixed_path.write_text(prefixed_source, encoding="utf-8")
@@ -443,11 +445,33 @@ def run_differential_fuzz(
     if not stages["compile_harness"]["ok"]:
         return _fuzz_result(False, "compile_harness", stages, combined_ir_path, executable_path)
 
+    stages["verify_reference_ir"] = command_runner(
+        [llvm_link, str(source_prefixed_path), "-S", "-o", str(source_verified_path)],
+        timeout=timeout,
+    )
+    if not stages["verify_reference_ir"]["ok"]:
+        return _fuzz_result(False, "verify_reference_ir", stages, combined_ir_path, executable_path)
+
+    stages["verify_candidate_ir"] = command_runner(
+        [llvm_link, str(candidate_prefixed_path), "-S", "-o", str(candidate_verified_path)],
+        timeout=timeout,
+    )
+    if not stages["verify_candidate_ir"]["ok"]:
+        return _fuzz_result(
+            False,
+            "verify_candidate_ir",
+            stages,
+            combined_ir_path,
+            executable_path,
+            forced_status="fail",
+            counterexample_kind="invalid-candidate-ir",
+        )
+
     stages["link_ir"] = command_runner(
         [
             llvm_link,
-            str(source_prefixed_path),
-            str(candidate_prefixed_path),
+            str(source_verified_path),
+            str(candidate_verified_path),
             str(harness_ir_path),
             "-S",
             "-o",
@@ -504,16 +528,31 @@ def _fuzz_result(
     stages: dict[str, Any],
     combined_ir_path: Path,
     executable_path: Path,
+    forced_status: str | None = None,
+    counterexample_kind: str | None = None,
 ) -> dict[str, Any]:
     fuzz_stage = stages.get("fuzz") or {}
     fuzz_output = f"{fuzz_stage.get('stdout', '')}\n{fuzz_stage.get('stderr', '')}"
-    has_counterexample = "COMAGENT_DIFFERENTIAL_MISMATCH" in fuzz_output
-    status = "pass" if ok else ("fail" if has_counterexample else "inconclusive")
+    is_input_timeout = "libFuzzer: timeout" in fuzz_output
+    has_mismatch = "COMAGENT_DIFFERENTIAL_MISMATCH" in fuzz_output
+    candidate_runtime_failure = (
+        not is_input_timeout
+        and "__comagent_candidate_" in fuzz_output
+        and any(marker in fuzz_output for marker in ("AddressSanitizer", "UndefinedBehaviorSanitizer", "runtime error:"))
+    )
+    has_counterexample = has_mismatch or candidate_runtime_failure or forced_status == "fail"
+    if counterexample_kind is None:
+        if has_mismatch:
+            counterexample_kind = "state-mismatch"
+        elif candidate_runtime_failure:
+            counterexample_kind = "candidate-runtime-failure"
+    status = forced_status or ("pass" if ok else ("fail" if has_counterexample else "inconclusive"))
     return {
         "enabled": True,
         "ok": ok,
         "status": status,
         "counterexample": has_counterexample,
+        "counterexample_kind": counterexample_kind,
         "stage": stage,
         "stages": stages,
         "combined_ir": str(combined_ir_path),

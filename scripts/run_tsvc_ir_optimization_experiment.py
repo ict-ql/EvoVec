@@ -70,11 +70,13 @@ def run_cmd(cmd: list[str], *, timeout: int | None = None, input_text: str | Non
             "ok": False,
         }
     except subprocess.TimeoutExpired as exc:
+        stdout = exc.stdout.decode("utf-8", errors="replace") if isinstance(exc.stdout, bytes) else (exc.stdout or "")
+        stderr = exc.stderr.decode("utf-8", errors="replace") if isinstance(exc.stderr, bytes) else (exc.stderr or "")
         return {
             "cmd": cmd,
             "returncode": 124,
-            "stdout": exc.stdout or "",
-            "stderr": exc.stderr or "",
+            "stdout": stdout,
+            "stderr": stderr,
             "elapsed_sec": round(time.time() - start, 3),
             "ok": False,
             "error": "timeout",
@@ -1170,7 +1172,7 @@ def main() -> int:
     parser.add_argument("--recommendation-top-k", type=int, default=20)
     parser.add_argument("--checksum-atol", type=float, default=1e-3)
     parser.add_argument("--build-timeout", type=int, default=60)
-    parser.add_argument("--run-timeout", type=int, default=60)
+    parser.add_argument("--run-timeout", type=int, default=300)
     parser.add_argument(
         "--alive2",
         action="store_true",
@@ -1202,6 +1204,11 @@ def main() -> int:
         action="store_true",
         help="Reuse existing successful llm.json + candidate.ll outputs instead of calling the LLM again.",
     )
+    parser.add_argument(
+        "--resume-completed",
+        action="store_true",
+        help="Reuse successful mode records from out-dir/records.jsonl without rerunning their validators.",
+    )
     parser.add_argument("--jobs", type=int, default=1, help="Number of mode jobs to run concurrently.")
     args = parser.parse_args()
 
@@ -1219,6 +1226,8 @@ def main() -> int:
         parser.error("fuzz timeouts must be positive")
     if args.seed_results_dir and not args.skip_existing:
         parser.error("--seed-results-dir requires --skip-existing")
+    if args.resume_completed and not args.skip_existing:
+        parser.error("--resume-completed requires --skip-existing")
     if args.prompt_only and args.generate_only:
         parser.error("--prompt-only and --generate-only are mutually exclusive")
     if args.offset < 0:
@@ -1281,6 +1290,16 @@ def main() -> int:
     target_info["target_attributes"] = target_attr_info
     (args.out_dir / "target.json").write_text(json.dumps(target_info, indent=2), encoding="utf-8")
     records_path = args.out_dir / "records.jsonl"
+    resume_snapshot_path = args.out_dir / "records.resume_snapshot.jsonl"
+    previous_by_task: dict[tuple[int, str], dict[str, Any]] = {}
+    if args.resume_completed:
+        resume_sources = [path for path in (resume_snapshot_path, records_path) if path.exists()]
+        for source in resume_sources:
+            for record in load_jsonl(source):
+                if "task_index" in record and "kernel" in record:
+                    previous_by_task[(int(record["task_index"]), str(record["kernel"]))] = record
+        if previous_by_task and not resume_snapshot_path.exists():
+            write_jsonl(resume_snapshot_path, list(previous_by_task.values()))
     records_path.write_text("", encoding="utf-8")
     records: list[dict[str, Any]] = []
     work_items: list[dict[str, Any]] = []
@@ -1291,6 +1310,25 @@ def main() -> int:
         task_dir = args.out_dir / f"{task_index:04d}_{kernel}"
         task_dir.mkdir(parents=True, exist_ok=True)
         scalar_ir_path = args.ir_dir / f"{kernel}.ll"
+        previous_record = previous_by_task.get((task_index, kernel), {})
+        previous_modes = previous_record.get("modes", {}) if isinstance(previous_record, dict) else {}
+        if previous_modes and all(previous_modes.get(mode, {}).get("ok") for mode in modes):
+            records.append(previous_record)
+            write_jsonl(records_path, records)
+            print(
+                json.dumps(
+                    {
+                        "task_index": task_index,
+                        "kernel": kernel,
+                        "ok": True,
+                        "resume_skipped_completed": True,
+                        "modes": modes,
+                    },
+                    sort_keys=True,
+                ),
+                flush=True,
+            )
+            continue
 
         ir_result = compile_scalar_ir(args, task, scalar_ir_path)
         (task_dir / "scalar_ir_emit.json").write_text(json.dumps(ir_result, indent=2), encoding="utf-8")
@@ -1361,11 +1399,17 @@ def main() -> int:
             "scalar_ir_target_attribute_patch": scalar_attr_patch,
             "expected_checksum": expected_checksum,
             "recommendation_regions": len(recommendation_rows),
-            "modes": {},
-            "ok": False,
+            "modes": {
+                mode: previous_modes[mode]
+                for mode in modes
+                if previous_modes.get(mode, {}).get("ok")
+            },
+            "ok": any(previous_modes.get(mode, {}).get("ok") for mode in modes),
         }
         records.append(record)
         for mode in modes:
+            if record["modes"].get(mode, {}).get("ok"):
+                continue
             work_items.append(
                 {
                     "record": record,
@@ -1456,6 +1500,7 @@ def main() -> int:
         "prompt_only": args.prompt_only,
         "generate_only": args.generate_only,
         "skip_existing": args.skip_existing,
+        "resume_completed": args.resume_completed,
         "seed_results_dir": str(args.seed_results_dir) if args.seed_results_dir else None,
         "ir_postprocess": not args.no_ir_postprocess,
         "skip_scalar_ir_eval": args.skip_scalar_ir_eval,

@@ -345,19 +345,31 @@ semantic validators are inconclusive and the TSVC run passes, the runner stops
 without spending another repair attempt. The TSVC checksum remains an independent
 diagnostic and performance-harness result. If neither semantic validator is
 enabled, the TSVC checksum remains the acceptance condition.
+The fuzz pipeline verifies the prefixed reference and candidate modules
+separately before linking them. Invalid candidate IR and sanitizer failures whose
+stack is inside the candidate kernel are concrete failures; crashes in the
+reference kernel remain inconclusive because generated inputs may violate a
+kernel-specific precondition.
 
 To reuse attempt-zero generations from an earlier result directory while
 writing a separate self-correction condition, add:
 
 ```bash
   --seed-results-dir runs/tsvc_ir_opt/gpt5_top20 \
-  --skip-existing
+  --skip-existing \
+  --resume-completed
 ```
 Every seeded baseline and guided candidate is copied into attempt zero and rerun
 through TSVC, Alive2, and merged-IR fuzzing. A failed TSVC check or concrete
 Alive2/fuzz counterexample is included in the repair prompt for the next attempt.
 `summary.json` reports the seeded and passing counts under
 `attempt_zero_validation`; pass `--limit 0` to process the complete manifest.
+On a later invocation using the same output directory, `--resume-completed`
+reuses successful mode records without rerunning their reference build or any
+validator. Failed modes continue independently, while `--skip-existing` reuses
+every successful LLM generation from their existing attempt directories. The
+runner keeps `records.resume_snapshot.jsonl` so an interrupted resume retains the
+last complete set of success records.
 Generated candidate IR is post-processed before verification to repair common
 LLM syntax issues such as redundant vector operand types, opaque-pointer
 bitcasts, and SSA-assigned constants. Each mode writes `postprocess.json` with
