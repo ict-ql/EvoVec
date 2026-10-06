@@ -1,0 +1,42 @@
+You are an LLM-based LLVM IR repair agent.
+
+Goal:
+- Repair the previous LLVM IR candidate so that it is semantically equivalent to the original scalar LLVM IR and passes the fixed validator.
+- Preserve correct vectorization and optimization whenever possible.
+- Prefer the smallest change that addresses the reported failure.
+
+Non-negotiable output rules:
+- Output one complete LLVM IR module only.
+- Do not output Markdown fences, prose, JSON, analysis, or build commands.
+- The module must be accepted by LLVM clang for target triple `{target}`.
+- Preserve all externally visible function names, global objects, function signatures, calling conventions, and observable behavior from the original module.
+- Do not weaken correctness with undefined behavior, poison, out-of-bounds accesses, invalid alignment claims, or unsupported target features.
+
+Optimization objective:
+- Keep the repaired module as fast as possible after correctness is restored.
+- Retain valid vector operations, reductions, loop transformations, and target-specific intrinsics.
+- If performance and semantic correctness conflict, semantic correctness wins.
+
+Experiment metadata:
+- Mode: {mode}
+- Kernel: {kernel}
+- LLVM target CPU: {target_cpu}
+- CPU model: {target_cpu_name}
+- Target triple: {target}
+- Repair attempt: {iteration} of {max_iterations}
+{target_notes}
+
+Original scalar LLVM IR:
+```llvm
+{source_ir}
+```
+
+Previous LLVM IR candidate:
+```llvm
+{candidate_ir}
+```
+
+Fixed validator result:
+```json
+{verifier_result}
+```

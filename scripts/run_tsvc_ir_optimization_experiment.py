@@ -20,6 +20,7 @@ from typing import Any
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 DEFAULT_TEMPLATE = REPO_ROOT / "prompts/llvm_ir_vectorize_fast_v1.txt"
+DEFAULT_REPAIR_TEMPLATE = REPO_ROOT / "prompts/llvm_ir_self_correction_fast_v1.txt"
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -312,6 +313,7 @@ def build_and_run_ir(
                 abs_tol=args.checksum_atol,
             )
     return {
+        "method": "reference-oracle-checksum-differential",
         "exe": str(exe),
         "compile": compile_result,
         "run": run_result,
@@ -320,6 +322,135 @@ def build_and_run_ir(
         "checksum_atol": args.checksum_atol,
         "checksum_ok": checksum_ok,
         "ok": bool(compile_result["ok"] and run_result and run_result["ok"] and parsed and parsed["ok"] and checksum_ok),
+    }
+
+
+def run_alive2(
+    args: argparse.Namespace,
+    source_ir_path: Path,
+    candidate_ir_path: Path,
+) -> dict[str, Any]:
+    if not args.alive2:
+        return {"enabled": False, "ok": True, "skipped": True}
+    command = [
+        args.alive_tv,
+        *args.alive2_arg,
+        str(source_ir_path),
+        str(candidate_ir_path),
+    ]
+    result = run_cmd(command, timeout=args.alive2_timeout)
+    output = f"{result.get('stdout', '')}\n{result.get('stderr', '')}"
+    success_markers = (
+        "Transformation seems to be correct!",
+        "0 incorrect transformations",
+    )
+    has_failure = bool(
+        "ERROR:" in output
+        or "doesn't verify" in output
+        or re.search(r"\b[1-9]\d* incorrect transformations", output)
+        or re.search(r"\b[1-9]\d* failed-to-prove transformations", output)
+    )
+    result["enabled"] = True
+    result["verified"] = bool(
+        result["ok"]
+        and any(marker in output for marker in success_markers)
+        and not has_failure
+    )
+    result["ok"] = result["verified"]
+    return result
+
+
+def validate_ir_candidate(
+    args: argparse.Namespace,
+    task: dict[str, Any],
+    source_ir_path: Path,
+    candidate_ir_path: Path,
+    out_dir: Path,
+    expected_checksum: float,
+) -> dict[str, Any]:
+    alive2_result = run_alive2(args, source_ir_path, candidate_ir_path)
+    differential_result = build_and_run_ir(args, task, candidate_ir_path, out_dir, expected_checksum)
+    if args.differential_fuzz:
+        from neural_asm_pipeline.differential_fuzz import run_differential_fuzz
+
+        fuzz_result = run_differential_fuzz(
+            source_ir_path=source_ir_path,
+            candidate_ir_path=candidate_ir_path,
+            task=task,
+            support_dir=task_paths(args, task)["support_dir"],
+            out_dir=out_dir / "libfuzzer",
+            clang=args.clang,
+            llvm_link=args.llvm_link,
+            march=args.target_attr_march,
+            runs=args.fuzz_runs,
+            max_len=args.fuzz_max_len,
+            per_input_timeout=args.fuzz_input_timeout,
+            timeout=args.fuzz_timeout,
+            sanitizers=args.fuzz_sanitizers,
+            extra_clang_args=args.extra_clang_arg,
+            command_runner=run_cmd,
+        )
+    else:
+        fuzz_result = {"enabled": False, "ok": True, "skipped": True}
+    methods = ["reference-oracle-checksum-differential"]
+    if args.alive2:
+        methods.insert(0, "alive2")
+    if args.differential_fuzz:
+        methods.append("libfuzzer-merged-ir-differential")
+    return {
+        "methods": methods,
+        "alive2": alive2_result,
+        "differential": differential_result,
+        "differential_fuzz": fuzz_result,
+        "ok": bool(alive2_result["ok"] and differential_result["ok"] and fuzz_result["ok"]),
+    }
+
+
+def repair_verifier_feedback(result: dict[str, Any]) -> dict[str, Any]:
+    alive2_result = result.get("alive2") or {}
+    differential = result.get("differential") or result
+    compile_result = differential.get("compile") or {}
+    run_result = differential.get("run") or {}
+    parsed = differential.get("parsed") or {}
+    fuzz_result = result.get("differential_fuzz") or {}
+    fuzz_stage = str(fuzz_result.get("stage") or "")
+    fuzz_stage_result = (fuzz_result.get("stages") or {}).get(fuzz_stage) or {}
+    return {
+        "ok": bool(result.get("ok")),
+        "alive2": {
+            "enabled": bool(alive2_result.get("enabled")),
+            "ok": bool(alive2_result.get("ok")),
+            "returncode": alive2_result.get("returncode"),
+            "stdout": alive2_result.get("stdout", ""),
+            "stderr": alive2_result.get("stderr", ""),
+            "error": alive2_result.get("error"),
+        },
+        "differential": {
+            "ok": bool(differential.get("ok")),
+            "compile_ok": bool(compile_result.get("ok")),
+            "compile_returncode": compile_result.get("returncode"),
+            "compile_stderr": compile_result.get("stderr", ""),
+            "compile_error": compile_result.get("error"),
+            "run_ok": bool(run_result.get("ok")),
+            "run_returncode": run_result.get("returncode"),
+            "run_stdout": run_result.get("stdout", ""),
+            "run_stderr": run_result.get("stderr", ""),
+            "run_error": run_result.get("error"),
+            "parse_error": parsed.get("error"),
+            "expected_checksum": differential.get("expected_checksum"),
+            "observed_checksum": parsed.get("checksum"),
+            "checksum_atol": differential.get("checksum_atol"),
+            "checksum_ok": bool(differential.get("checksum_ok")),
+        },
+        "differential_fuzz": {
+            "enabled": bool(fuzz_result.get("enabled", bool(fuzz_result))),
+            "ok": bool(fuzz_result.get("ok")),
+            "stage": fuzz_stage or None,
+            "returncode": fuzz_stage_result.get("returncode"),
+            "stdout": fuzz_stage_result.get("stdout", ""),
+            "stderr": fuzz_stage_result.get("stderr", ""),
+            "error": fuzz_result.get("error") or fuzz_stage_result.get("error"),
+        },
     }
 
 
@@ -570,6 +701,40 @@ def render_prompt(
     )
 
 
+def render_repair_prompt(
+    template: str,
+    *,
+    mode: str,
+    task: dict[str, Any],
+    source_ir: str,
+    candidate_ir: str,
+    verifier_result: dict[str, Any],
+    iteration: int,
+    max_iterations: int,
+    target: str,
+    target_cpu: str,
+    target_cpu_name: str,
+    target_notes: str,
+) -> str:
+    return template.format(
+        kernel=task["kernel"],
+        mode=mode,
+        target=target,
+        target_cpu=target_cpu,
+        target_cpu_name=target_cpu_name,
+        target_notes=target_notes,
+        iteration=iteration + 1,
+        max_iterations=max_iterations,
+        source_ir=source_ir,
+        candidate_ir=candidate_ir,
+        verifier_result=json.dumps(verifier_result, indent=2, sort_keys=True),
+    )
+
+
+def iteration_dir(mode_dir: Path, iteration: int) -> Path:
+    return mode_dir if iteration == 0 else mode_dir / f"iter_{iteration:02d}"
+
+
 def call_llm(args: argparse.Namespace, prompt: str) -> dict[str, Any]:
     if args.agent_cmd:
         return run_cmd(shlex.split(args.agent_cmd, posix=os.name != "nt"), timeout=args.agent_timeout, input_text=prompt)
@@ -614,6 +779,9 @@ def run_mode(
     task: dict[str, Any],
     task_dir: Path,
     template: str,
+    repair_template: str,
+    seed_mode_dir: Path | None,
+    scalar_ir_path: Path,
     scalar_ir: str,
     recommendation_rows: list[dict[str, Any]],
     expected_checksum: float | None,
@@ -643,97 +811,159 @@ def run_mode(
         target_cpu_name=args.target_cpu_name,
         target_notes=args.target_notes,
     )
-    prompt_path = mode_dir / "prompt.txt"
-    llm_path = mode_dir / "llm.json"
-    candidate_ir_path = mode_dir / "candidate.ll"
-    postprocess_path = mode_dir / "postprocess.json"
-    verify_path = mode_dir / "verify.json"
-    prompt_path.write_text(prompt, encoding="utf-8")
-
     record: dict[str, Any] = {
         "mode": mode,
-        "prompt_path": str(prompt_path),
-        "llm_path": str(llm_path),
-        "candidate_ir": str(candidate_ir_path),
-        "postprocess_path": str(postprocess_path),
-        "verify_path": str(verify_path),
         "recommendation_regions": len(recommendation_rows) if mode != "baseline" else 0,
+        "max_iterations": args.max_iters,
+        "iterations": [],
     }
     if args.prompt_only:
+        prompt_path = mode_dir / "prompt.txt"
+        prompt_path.write_text(prompt, encoding="utf-8")
+        record["prompt_path"] = str(prompt_path)
         record["ok"] = False
         record["prompt_only"] = True
         return record
-
-    existing_llm_result = (
-        successful_existing_generation(llm_path, candidate_ir_path) if args.skip_existing else None
-    )
-    if existing_llm_result is not None:
-        llm_result = existing_llm_result
-        record["skipped_existing_generation"] = True
-    else:
-        llm_result = call_llm(args, prompt)
-        llm_path.write_text(json.dumps(llm_result, indent=2), encoding="utf-8")
-    record["llm_ok"] = llm_result["ok"]
-    record["llm_elapsed_sec"] = llm_result.get("elapsed_sec")
-    if not llm_result["ok"]:
-        record["ok"] = False
-        record["error"] = llm_result.get("error") or llm_result.get("stderr")
-        return record
-
-    if existing_llm_result is None:
-        candidate_ir = strip_markdown_fence(str(llm_result["stdout"]))
-        candidate_ir_path.write_text(candidate_ir, encoding="utf-8")
-    postprocess_summary = postprocess_ir_if_enabled(args, candidate_ir_path)
-    postprocess_path.write_text(json.dumps(postprocess_summary, indent=2), encoding="utf-8")
-    attr_patch = patch_target_attributes_if_enabled(args, candidate_ir_path)
-    if existing_llm_result is not None:
-        attr_patch["skipped_existing_generation"] = True
-
-    if args.generate_only:
-        record.update(
-            {
-                "ok": True,
-                "generated_only": True,
-                "verify_skipped": True,
-                "ir_postprocess": postprocess_summary,
-                "target_attribute_patch": attr_patch,
-            }
-        )
-        return record
-
-    if expected_checksum is None:
+    if expected_checksum is None and not args.generate_only:
         record["ok"] = False
         record["error"] = "verification requires expected checksum"
         return record
 
-    verify_result = build_and_run_ir(args, task, candidate_ir_path, mode_dir / "candidate", expected_checksum)
-    verify_path.write_text(json.dumps(verify_result, indent=2), encoding="utf-8")
-    parsed = verify_result.get("parsed") or {}
-    observed_time = parsed.get("time_sec")
-    record.update(
-        {
-            "ok": verify_result["ok"],
-            "compile_ok": verify_result["compile"]["ok"],
-            "run_ok": bool(verify_result.get("run") and verify_result["run"]["ok"]),
-            "checksum_ok": verify_result["checksum_ok"],
-            "ir_postprocess": postprocess_summary,
-            "target_attribute_patch": attr_patch,
-            "observed_checksum": parsed.get("checksum"),
-            "observed_time_sec": observed_time,
-            "reference_time_sec": reference_time,
-            "scalar_ir_time_sec": scalar_time,
-            "speedup_vs_scalar_ir": (
-                float(scalar_time) / float(observed_time)
-                if scalar_time and observed_time and float(observed_time) > 0.0
-                else None
-            ),
-            "speedup_vs_reference": (
-                float(reference_time) / float(observed_time)
-                if reference_time and observed_time and float(observed_time) > 0.0
-                else None
-            ),
+    current_prompt = prompt
+    previous_candidate = ""
+    previous_verify: dict[str, Any] = {}
+    for iteration in range(args.max_iters):
+        attempt_dir = iteration_dir(mode_dir, iteration)
+        attempt_dir.mkdir(parents=True, exist_ok=True)
+        if iteration > 0:
+            current_prompt = render_repair_prompt(
+                repair_template,
+                mode=mode,
+                task=task,
+                source_ir=scalar_ir,
+                candidate_ir=previous_candidate,
+                verifier_result=repair_verifier_feedback(previous_verify),
+                iteration=iteration,
+                max_iterations=args.max_iters,
+                target=args.target,
+                target_cpu=args.target_cpu,
+                target_cpu_name=args.target_cpu_name,
+                target_notes=args.target_notes,
+            )
+
+        prompt_path = attempt_dir / "prompt.txt"
+        llm_path = attempt_dir / "llm.json"
+        candidate_ir_path = attempt_dir / "candidate.ll"
+        postprocess_path = attempt_dir / "postprocess.json"
+        verify_path = attempt_dir / "verify.json"
+        prompt_path.write_text(current_prompt, encoding="utf-8")
+        existing_dir = seed_mode_dir if iteration == 0 and seed_mode_dir is not None else attempt_dir
+        existing_llm_path = existing_dir / "llm.json"
+        existing_candidate_path = existing_dir / "candidate.ll"
+        existing_llm_result = (
+            successful_existing_generation(existing_llm_path, existing_candidate_path)
+            if args.skip_existing
+            else None
+        )
+        if existing_llm_result is not None:
+            llm_result = existing_llm_result
+            if existing_llm_path.resolve() != llm_path.resolve():
+                llm_path.write_text(json.dumps(llm_result, indent=2), encoding="utf-8")
+                shutil.copyfile(existing_candidate_path, candidate_ir_path)
+        else:
+            llm_result = call_llm(args, current_prompt)
+            llm_path.write_text(json.dumps(llm_result, indent=2), encoding="utf-8")
+
+        attempt: dict[str, Any] = {
+            "iteration": iteration,
+            "prompt_path": str(prompt_path),
+            "llm_path": str(llm_path),
+            "candidate_ir": str(candidate_ir_path),
+            "postprocess_path": str(postprocess_path),
+            "verify_path": str(verify_path),
+            "llm_ok": bool(llm_result["ok"]),
+            "llm_elapsed_sec": llm_result.get("elapsed_sec"),
+            "skipped_existing_generation": existing_llm_result is not None,
         }
-    )
+        record["iterations"].append(attempt)
+        if not llm_result["ok"]:
+            attempt.update(
+                {
+                    "ok": False,
+                    "error": llm_result.get("error") or llm_result.get("stderr"),
+                    "alive2_ok": None,
+                    "differential_fuzz_ok": None,
+                    "compile_ok": None,
+                    "run_ok": None,
+                    "checksum_ok": None,
+                }
+            )
+            record.update(attempt)
+            record["ok"] = False
+            record["error"] = attempt["error"]
+            break
+
+        if existing_llm_result is None:
+            candidate_ir = strip_markdown_fence(str(llm_result["stdout"]))
+            candidate_ir_path.write_text(candidate_ir, encoding="utf-8")
+        postprocess_summary = postprocess_ir_if_enabled(args, candidate_ir_path)
+        postprocess_path.write_text(json.dumps(postprocess_summary, indent=2), encoding="utf-8")
+        attr_patch = patch_target_attributes_if_enabled(args, candidate_ir_path)
+        if existing_llm_result is not None:
+            attr_patch["skipped_existing_generation"] = True
+        attempt["ir_postprocess"] = postprocess_summary
+        attempt["target_attribute_patch"] = attr_patch
+
+        if args.generate_only:
+            attempt.update({"ok": True, "generated_only": True, "verify_skipped": True})
+            record.update(attempt)
+            record["ok"] = True
+            record["generated_only"] = True
+            break
+
+        verify_result = validate_ir_candidate(
+            args,
+            task,
+            scalar_ir_path,
+            candidate_ir_path,
+            attempt_dir / "candidate",
+            float(expected_checksum),
+        )
+        verify_path.write_text(json.dumps(verify_result, indent=2), encoding="utf-8")
+        differential_result = verify_result["differential"]
+        parsed = differential_result.get("parsed") or {}
+        observed_time = parsed.get("time_sec")
+        attempt.update(
+            {
+                "ok": verify_result["ok"],
+                "alive2_ok": verify_result["alive2"]["ok"],
+                "differential_fuzz_ok": verify_result["differential_fuzz"]["ok"],
+                "compile_ok": differential_result["compile"]["ok"],
+                "run_ok": bool(differential_result.get("run") and differential_result["run"]["ok"]),
+                "checksum_ok": differential_result["checksum_ok"],
+                "observed_checksum": parsed.get("checksum"),
+                "observed_time_sec": observed_time,
+                "reference_time_sec": reference_time,
+                "scalar_ir_time_sec": scalar_time,
+                "speedup_vs_scalar_ir": (
+                    float(scalar_time) / float(observed_time)
+                    if scalar_time and observed_time and float(observed_time) > 0.0
+                    else None
+                ),
+                "speedup_vs_reference": (
+                    float(reference_time) / float(observed_time)
+                    if reference_time and observed_time and float(observed_time) > 0.0
+                    else None
+                ),
+            }
+        )
+        record.update(attempt)
+        record["ok"] = bool(attempt["ok"])
+        if attempt["ok"]:
+            record["success_iteration"] = iteration
+            break
+        previous_candidate = candidate_ir_path.read_text(encoding="utf-8", errors="replace")
+        previous_verify = verify_result
     return record
 
 
@@ -758,6 +988,11 @@ def main() -> int:
         help="JSON/JSONL map produced by resolve_llvm_intrinsic_declarations.py.",
     )
     parser.add_argument("--out-dir", type=Path, required=True)
+    parser.add_argument(
+        "--seed-results-dir",
+        type=Path,
+        help="Read attempt-zero llm.json and candidate.ll from another result directory with --skip-existing.",
+    )
     parser.add_argument("--agent-cmd", default="", help="Compatibility path: command that reads prompt stdin and writes IR stdout.")
     parser.add_argument("--llm-config", "--config", dest="llm_config", type=Path, help="YAML/JSON config with optional llm: section.")
     parser.add_argument("--model", default="", help="Override config llm.llm_model / OPENAI_MODEL.")
@@ -771,6 +1006,13 @@ def main() -> int:
     parser.add_argument("--max-retries", type=int, default=2)
     parser.add_argument("--base-backoff", type=float, default=1.0)
     parser.add_argument("--template", type=Path, default=DEFAULT_TEMPLATE)
+    parser.add_argument("--repair-template", type=Path, default=DEFAULT_REPAIR_TEMPLATE)
+    parser.add_argument(
+        "--max-iters",
+        type=int,
+        default=5,
+        help="Maximum attempts per mode, including generation.",
+    )
     parser.add_argument("--tsvc-root", type=Path)
     parser.add_argument("--ir-dir", type=Path, default=REPO_ROOT / "runs/tsvc_prevec_ir")
     parser.add_argument("--kernels", default="all")
@@ -820,6 +1062,25 @@ def main() -> int:
     parser.add_argument("--checksum-atol", type=float, default=1e-3)
     parser.add_argument("--build-timeout", type=int, default=60)
     parser.add_argument("--run-timeout", type=int, default=60)
+    parser.add_argument(
+        "--alive2",
+        action="store_true",
+        help="Require Alive2 refinement verification before accepting IR.",
+    )
+    parser.add_argument("--alive-tv", default="alive-tv", help="Path to the Alive2 alive-tv executable.")
+    parser.add_argument("--alive2-arg", action="append", default=[], help="Additional argument passed to alive-tv.")
+    parser.add_argument("--alive2-timeout", type=int, default=300)
+    parser.add_argument(
+        "--differential-fuzz",
+        action="store_true",
+        help="Require merged reference/candidate IR differential testing with libFuzzer.",
+    )
+    parser.add_argument("--llvm-link", default="llvm-link")
+    parser.add_argument("--fuzz-runs", type=int, default=1000)
+    parser.add_argument("--fuzz-max-len", type=int, default=4096)
+    parser.add_argument("--fuzz-input-timeout", type=int, default=5)
+    parser.add_argument("--fuzz-timeout", type=int, default=900)
+    parser.add_argument("--fuzz-sanitizers", default="fuzzer,address")
     parser.add_argument("--agent-timeout", type=int, default=900)
     parser.add_argument("--prompt-only", action="store_true")
     parser.add_argument(
@@ -839,6 +1100,16 @@ def main() -> int:
         args.limit = 0
     if args.jobs <= 0:
         parser.error("--jobs must be positive")
+    if args.max_iters <= 0:
+        parser.error("--max-iters must be positive")
+    if args.fuzz_runs <= 0:
+        parser.error("--fuzz-runs must be positive")
+    if args.fuzz_max_len <= 0:
+        parser.error("--fuzz-max-len must be positive")
+    if args.fuzz_input_timeout <= 0 or args.fuzz_timeout <= 0:
+        parser.error("fuzz timeouts must be positive")
+    if args.seed_results_dir and not args.skip_existing:
+        parser.error("--seed-results-dir requires --skip-existing")
     if args.prompt_only and args.generate_only:
         parser.error("--prompt-only and --generate-only are mutually exclusive")
     if args.offset < 0:
@@ -890,6 +1161,7 @@ def main() -> int:
 
     modes = parse_modes(args.modes)
     template = args.template.read_text(encoding="utf-8")
+    repair_template = args.repair_template.read_text(encoding="utf-8")
     recommendations = load_recommendations(args.recommendations_jsonl)
     args.intrinsic_declarations = load_intrinsic_declarations(args.intrinsic_declarations_json)
     selected = select_tasks(load_jsonl(args.manifest), args.kernels, args.offset, args.limit)
@@ -994,6 +1266,10 @@ def main() -> int:
                     "task": task,
                     "task_dir": task_dir,
                     "template": template,
+                    "seed_mode_dir": (
+                        args.seed_results_dir / task_dir.name / mode if args.seed_results_dir else None
+                    ),
+                    "scalar_ir_path": scalar_ir_path,
                     "scalar_ir": scalar_ir,
                     "recommendation_rows": recommendation_rows,
                     "expected_checksum": expected_checksum,
@@ -1013,6 +1289,9 @@ def main() -> int:
                     task=item["task"],
                     task_dir=item["task_dir"],
                     template=item["template"],
+                    repair_template=repair_template,
+                    seed_mode_dir=item["seed_mode_dir"],
+                    scalar_ir_path=item["scalar_ir_path"],
                     scalar_ir=item["scalar_ir"],
                     recommendation_rows=item["recommendation_rows"],
                     expected_checksum=item["expected_checksum"],
@@ -1068,12 +1347,46 @@ def main() -> int:
         "prompt_only": args.prompt_only,
         "generate_only": args.generate_only,
         "skip_existing": args.skip_existing,
+        "seed_results_dir": str(args.seed_results_dir) if args.seed_results_dir else None,
         "ir_postprocess": not args.no_ir_postprocess,
         "skip_scalar_ir_eval": args.skip_scalar_ir_eval,
         "jobs": args.jobs,
+        "max_iters": args.max_iters,
+        "validation_methods": (
+            (["alive2"] if args.alive2 else [])
+            + ["reference-oracle-checksum-differential"]
+            + (["libfuzzer-merged-ir-differential"] if args.differential_fuzz else [])
+        ),
+        "differential_fuzz": {
+            "enabled": args.differential_fuzz,
+            "llvm_link": args.llvm_link if args.differential_fuzz else None,
+            "runs": args.fuzz_runs if args.differential_fuzz else None,
+            "max_len": args.fuzz_max_len if args.differential_fuzz else None,
+            "input_timeout": args.fuzz_input_timeout if args.differential_fuzz else None,
+            "timeout": args.fuzz_timeout if args.differential_fuzz else None,
+            "sanitizers": args.fuzz_sanitizers if args.differential_fuzz else None,
+        },
         "records": str(records_path),
         "successes": {
             mode: sum(1 for record in records if record.get("modes", {}).get(mode, {}).get("ok"))
+            for mode in modes
+        },
+        "pass_at_1": {
+            mode: sum(
+                1
+                for record in records
+                if record.get("modes", {}).get(mode, {}).get("iterations")
+                and record["modes"][mode]["iterations"][0].get("ok")
+            )
+            for mode in modes
+        },
+        "recovered_by_self_correction": {
+            mode: sum(
+                1
+                for record in records
+                if record.get("modes", {}).get(mode, {}).get("ok")
+                and int(record.get("modes", {}).get(mode, {}).get("success_iteration", 0)) > 0
+            )
             for mode in modes
         },
     }

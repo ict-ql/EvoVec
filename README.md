@@ -293,21 +293,51 @@ python3 scripts/run_tsvc_ir_optimization_experiment.py \
   --manifest runs/manifests/tsvc_kernels.jsonl \
   --tsvc-root runs/tsvc_kernels/v1 \
   --recommendations-jsonl runs/tsvc_region_recommendations/top20/recommendations.jsonl \
-  --out-dir runs/tsvc_ir_opt/gpt5_top20 \
+  --out-dir runs/tsvc_ir_opt/gpt5_top20_alive2_diff_5 \
   --llm-config config/llm.example.yaml \
   --model gpt-5 \
   --max-tokens 16000 \
   --temperature 0.2 \
   --modes baseline,guided \
   --limit 10 \
+  --max-iters 5 \
+  --alive2 \
+  --alive-tv /path/to/alive-tv \
+  --differential-fuzz \
+  --llvm-link /path/to/llvm-link \
+  --fuzz-runs 10000 \
   --target-cpu auto \
   --clang clang \
   --cc cc
 ```
 
 The exact prompts, model outputs, compile/run logs, and per-kernel records are
-written under the output directory. `summary.json` reports success counts, mean
-times, and paired guided-vs-baseline speedup when both modes pass correctness.
+written under the output directory. Each mode gets at most five attempts by
+default: the initial generation followed by fixed-template self-correction using
+only the previous candidate and normalized validator feedback. Attempt zero
+keeps the original directory layout; later attempts are stored in `iter_01`
+through `iter_04`. `summary.json` reports pass@1, within-budget success,
+self-correction recoveries, mean times, and paired guided-vs-baseline speedup.
+The executable check is a differential test against the reference program's
+checksum. With `--alive2`, a candidate must also refine the original scalar IR
+according to `alive-tv`. With `--differential-fuzz`, the runner prefixes every
+defined reference and candidate function, compiles a per-kernel libFuzzer
+harness, and uses `llvm-link` to produce one `combined.ll`. The harness replaces
+`initialise_arrays` with deterministic input decoding, resets identical state
+before each implementation, and compares return values, argument state, all
+TSVC global arrays, `indx`, `xx`, and `yy` bit-for-bit. The default budget is
+1,000 generated inputs per candidate; use `--fuzz-runs` to raise it. All enabled
+checks must pass before the repair loop stops. Kernel-local `exit` calls are
+captured without intercepting libFuzzer itself: matching termination and exit
+status pass, while return-vs-exit or different exit statuses fail.
+
+To reuse attempt-zero generations from an earlier result directory while
+writing a separate self-correction condition, add:
+
+```bash
+  --seed-results-dir runs/tsvc_ir_opt/gpt5_top20 \
+  --skip-existing
+```
 Generated candidate IR is post-processed before verification to repair common
 LLM syntax issues such as redundant vector operand types, opaque-pointer
 bitcasts, and SSA-assigned constants. Each mode writes `postprocess.json` with
