@@ -89,6 +89,8 @@ static size_t fuzz_offset;
 static jmp_buf exit_jump;
 static int exit_armed;
 static int captured_exit_status;
+static int dummy_call_count;
+static uint32_t dummy_scalar_bits[3];
 
 static uint32_t next_u32(void) {
     uint32_t value = 0x9e3779b9u ^ (uint32_t)fuzz_offset;
@@ -154,7 +156,13 @@ int dummy(
     (void)aav;
     (void)bbv;
     (void)ccv;
-    (void)scalar;
+    if (dummy_call_count < 3) {
+        memcpy(&dummy_scalar_bits[dummy_call_count], &scalar, sizeof(scalar));
+    }
+    dummy_call_count++;
+    if (exit_armed && dummy_call_count >= 3) {
+        longjmp(exit_jump, 2);
+    }
     return 0;
 }
 
@@ -209,6 +217,8 @@ struct observed_state {
 struct run_result {
     int terminated;
     int exit_status;
+    int benchmark_iterations;
+    uint32_t dummy_scalar_bits[3];
     uint32_t return_bits;
     int n1;
     int n3;
@@ -255,22 +265,29 @@ static struct run_result run_kernel(kernel_function function) {
     struct args_t arguments = {.arg_info = @@ARG_EXPR@@};
     struct run_result summary;
     memset(&summary, 0, sizeof(summary));
+    summary.n1 = n1;
+    summary.n3 = n3;
+    memcpy(&summary.s1_bits, &s1, sizeof(s1));
+    memcpy(&summary.s2_bits, &s2, sizeof(s2));
+    memcpy(summary.ip, ip_storage, sizeof(ip_storage));
     captured_exit_status = 0;
+    dummy_call_count = 0;
+    memset(dummy_scalar_bits, 0, sizeof(dummy_scalar_bits));
     exit_armed = 1;
-    if (setjmp(exit_jump) != 0) {
+    int jump_reason = setjmp(exit_jump);
+    if (jump_reason != 0) {
         exit_armed = 0;
-        summary.terminated = 1;
-        summary.exit_status = captured_exit_status;
+        summary.terminated = jump_reason == 1;
+        summary.exit_status = jump_reason == 1 ? captured_exit_status : 0;
+        summary.benchmark_iterations = dummy_call_count;
+        memcpy(summary.dummy_scalar_bits, dummy_scalar_bits, sizeof(dummy_scalar_bits));
         return summary;
     }
     real_t result = function(&arguments);
     exit_armed = 0;
-    summary.n1 = n1;
-    summary.n3 = n3;
+    summary.benchmark_iterations = dummy_call_count;
+    memcpy(summary.dummy_scalar_bits, dummy_scalar_bits, sizeof(dummy_scalar_bits));
     memcpy(&summary.return_bits, &result, sizeof(result));
-    memcpy(&summary.s1_bits, &s1, sizeof(s1));
-    memcpy(&summary.s2_bits, &s2, sizeof(s2));
-    memcpy(summary.ip, ip_storage, sizeof(ip_storage));
     return summary;
 }
 
@@ -305,10 +322,22 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size) {
     struct run_result reference_result = run_kernel(__comagent_ref_@@KERNEL@@);
     capture_state(&reference_state);
     struct run_result candidate_result = run_kernel(__comagent_candidate_@@KERNEL@@);
-    compare_bytes("return-and-arguments", &reference_result, &candidate_result, sizeof(reference_result));
+    compare_bytes(
+        "termination-kind",
+        &reference_result.terminated,
+        &candidate_result.terminated,
+        sizeof(reference_result.terminated)
+    );
     if (reference_result.terminated) {
+        compare_bytes(
+            "exit-status",
+            &reference_result.exit_status,
+            &candidate_result.exit_status,
+            sizeof(reference_result.exit_status)
+        );
         return 0;
     }
+    compare_bytes("return-and-arguments", &reference_result, &candidate_result, sizeof(reference_result));
     struct observed_state candidate_state;
     capture_state(&candidate_state);
     compare_bytes("global-state", &reference_state, &candidate_state, sizeof(reference_state));
@@ -476,10 +505,15 @@ def _fuzz_result(
     combined_ir_path: Path,
     executable_path: Path,
 ) -> dict[str, Any]:
+    fuzz_stage = stages.get("fuzz") or {}
+    fuzz_output = f"{fuzz_stage.get('stdout', '')}\n{fuzz_stage.get('stderr', '')}"
+    has_counterexample = "COMAGENT_DIFFERENTIAL_MISMATCH" in fuzz_output
+    status = "pass" if ok else ("fail" if has_counterexample else "inconclusive")
     return {
         "enabled": True,
         "ok": ok,
-        "status": "pass" if ok else ("fail" if stage == "fuzz" else "inconclusive"),
+        "status": status,
+        "counterexample": has_counterexample,
         "stage": stage,
         "stages": stages,
         "combined_ir": str(combined_ir_path),

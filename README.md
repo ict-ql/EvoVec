@@ -328,14 +328,18 @@ before each implementation, and compares return values, argument state, all
 TSVC global arrays, `indx`, `xx`, and `yy` bit-for-bit. The default budget is
 1,000 generated inputs per candidate; use `--fuzz-runs` to raise it. TSVC array
 dimensions are inferred from the scalar IR and checked against the support
-headers instead of trusting possibly stale manifest dimensions. Kernel-local `exit` calls are
+headers instead of trusting possibly stale manifest dimensions. To avoid running
+the benchmark timing loop thousands of times per fuzz input, `dummy` ends each
+implementation after three completed benchmark iterations; its scalar arguments
+and the resulting global state are still compared. Kernel-local `exit` calls are
 captured without intercepting libFuzzer itself: matching termination and exit
 status pass, while return-vs-exit or different exit statuses fail.
 
 When Alive2 and merged-IR fuzzing are enabled, either semantic validator passing
 accepts the candidate and stops self-correction unless the other validator found
 a concrete counterexample. Unsupported Alive2 features and harness/toolchain
-failures are marked inconclusive rather than blamed on the candidate; if all
+failures, including libFuzzer timeouts without a differential mismatch, are
+marked inconclusive rather than blamed on the candidate; if all
 semantic validators are inconclusive and the TSVC run passes, the runner stops
 without spending another repair attempt. The TSVC checksum remains an independent
 diagnostic and performance-harness result. If neither semantic validator is
