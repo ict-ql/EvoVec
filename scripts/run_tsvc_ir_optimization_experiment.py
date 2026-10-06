@@ -89,7 +89,7 @@ def parse_tsvc_output(stdout: str) -> dict[str, Any]:
         return {"ok": False, "error": "empty stdout"}
     data_line = lines[-1]
     columns = data_line.split()
-    if len(columns) < 3:
+    if len(columns) < 2:
         return {"ok": False, "error": f"could not parse TSVC line: {data_line!r}"}
     try:
         time_sec = float(columns[-2])
@@ -1327,7 +1327,7 @@ def main() -> int:
             records.append(previous_record)
             write_jsonl(records_path, records)
             print(
-                f"[{task_index}/{len(kernels)}] {kernel}: preserved existing record "
+                f"[{task_index}/{len(selected)}] {kernel}: preserved existing record "
                 "(not selected for revalidation)",
                 flush=True,
             )
