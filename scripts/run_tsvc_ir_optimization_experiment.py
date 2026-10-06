@@ -88,15 +88,19 @@ def parse_tsvc_output(stdout: str) -> dict[str, Any]:
     if not lines:
         return {"ok": False, "error": "empty stdout"}
     data_line = lines[-1]
-    numbers = re.findall(r"[-+]?(?:\d+(?:\.\d*)?|\.\d+)(?:[eE][-+]?\d+)?", data_line)
-    if len(numbers) < 2:
+    columns = data_line.split()
+    if len(columns) < 3:
         return {"ok": False, "error": f"could not parse TSVC line: {data_line!r}"}
     try:
+        time_sec = float(columns[-2])
+        checksum = float(columns[-1])
+        if not math.isfinite(time_sec) or time_sec < 0.0:
+            return {"ok": False, "error": f"invalid TSVC time: {columns[-2]!r}", "line": data_line}
         return {
             "ok": True,
             "line": data_line,
-            "time_sec": float(numbers[-2]),
-            "checksum": float(numbers[-1]),
+            "time_sec": time_sec,
+            "checksum": checksum,
             "stdout": stdout,
         }
     except ValueError as exc:
@@ -1209,6 +1213,11 @@ def main() -> int:
         action="store_true",
         help="Reuse successful mode records from out-dir/records.jsonl without rerunning their validators.",
     )
+    parser.add_argument(
+        "--revalidate-kernels",
+        default="",
+        help="Comma-separated kernels whose successful records must be revalidated during resume.",
+    )
     parser.add_argument("--jobs", type=int, default=1, help="Number of mode jobs to run concurrently.")
     args = parser.parse_args()
 
@@ -1278,6 +1287,7 @@ def main() -> int:
     args.target_attributes = dict(target_attr_info.get("attributes", {}))
 
     modes = parse_modes(args.modes)
+    revalidate_kernels = {item.strip() for item in args.revalidate_kernels.split(",") if item.strip()}
     template = args.template.read_text(encoding="utf-8")
     repair_template = args.repair_template.read_text(encoding="utf-8")
     recommendations = load_recommendations(args.recommendations_jsonl)
@@ -1312,7 +1322,17 @@ def main() -> int:
         scalar_ir_path = args.ir_dir / f"{kernel}.ll"
         previous_record = previous_by_task.get((task_index, kernel), {})
         previous_modes = previous_record.get("modes", {}) if isinstance(previous_record, dict) else {}
-        if previous_modes and all(previous_modes.get(mode, {}).get("ok") for mode in modes):
+        force_revalidate = kernel in revalidate_kernels
+        if revalidate_kernels and not force_revalidate and previous_record:
+            records.append(previous_record)
+            write_jsonl(records_path, records)
+            print(
+                f"[{task_index}/{len(kernels)}] {kernel}: preserved existing record "
+                "(not selected for revalidation)",
+                flush=True,
+            )
+            continue
+        if not force_revalidate and previous_modes and all(previous_modes.get(mode, {}).get("ok") for mode in modes):
             records.append(previous_record)
             write_jsonl(records_path, records)
             print(
@@ -1402,9 +1422,9 @@ def main() -> int:
             "modes": {
                 mode: previous_modes[mode]
                 for mode in modes
-                if previous_modes.get(mode, {}).get("ok")
+                if not force_revalidate and previous_modes.get(mode, {}).get("ok")
             },
-            "ok": any(previous_modes.get(mode, {}).get("ok") for mode in modes),
+            "ok": not force_revalidate and any(previous_modes.get(mode, {}).get("ok") for mode in modes),
         }
         records.append(record)
         for mode in modes:
@@ -1501,6 +1521,7 @@ def main() -> int:
         "generate_only": args.generate_only,
         "skip_existing": args.skip_existing,
         "resume_completed": args.resume_completed,
+        "revalidate_kernels": sorted(revalidate_kernels),
         "seed_results_dir": str(args.seed_results_dir) if args.seed_results_dir else None,
         "ir_postprocess": not args.no_ir_postprocess,
         "skip_scalar_ir_eval": args.skip_scalar_ir_eval,
