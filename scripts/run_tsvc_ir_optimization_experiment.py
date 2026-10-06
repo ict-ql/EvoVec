@@ -471,10 +471,11 @@ def validate_ir_candidate(
         semantic_statuses.append(str(fuzz_result.get("status") or "inconclusive"))
     has_semantic_failure = "fail" in semantic_statuses
     has_semantic_pass = "pass" in semantic_statuses
+    tsvc_ok = bool(differential_result["ok"])
     accepted = (
-        has_semantic_pass and not has_semantic_failure
+        tsvc_ok and has_semantic_pass and not has_semantic_failure
         if semantic_statuses
-        else bool(differential_result["ok"])
+        else tsvc_ok
     )
     repairable = bool(
         has_semantic_failure
@@ -484,7 +485,7 @@ def validate_ir_candidate(
     )
     return {
         "methods": methods,
-        "acceptance_policy": "semantic-pass-without-counterexample" if semantic_statuses else "tsvc-checksum",
+        "acceptance_policy": "tsvc-pass-and-semantic-pass-without-counterexample" if semantic_statuses else "tsvc-checksum",
         "semantic_statuses": semantic_statuses,
         "repairable": repairable,
         "alive2": alive2_result,
@@ -976,6 +977,11 @@ def run_mode(
             "llm_ok": bool(llm_result["ok"]),
             "llm_elapsed_sec": llm_result.get("elapsed_sec"),
             "skipped_existing_generation": existing_llm_result is not None,
+            "candidate_origin": (
+                "seed"
+                if existing_llm_result is not None and iteration == 0 and seed_mode_dir is not None
+                else ("existing" if existing_llm_result is not None else "generated")
+            ),
         }
         record["iterations"].append(attempt)
         if not llm_result["ok"]:
@@ -1033,7 +1039,10 @@ def run_mode(
                 "repairable": verify_result["repairable"],
                 "semantic_statuses": verify_result["semantic_statuses"],
                 "alive2_ok": verify_result["alive2"]["ok"],
+                "alive2_status": verify_result["alive2"]["status"],
                 "differential_fuzz_ok": verify_result["differential_fuzz"]["ok"],
+                "differential_fuzz_status": verify_result["differential_fuzz"]["status"],
+                "tsvc_ok": differential_result["ok"],
                 "compile_ok": differential_result["compile"]["ok"],
                 "run_ok": bool(differential_result.get("run") and differential_result["run"]["ok"]),
                 "checksum_ok": differential_result["checksum_ok"],
@@ -1458,7 +1467,7 @@ def main() -> int:
             + (["libfuzzer-merged-ir-differential"] if args.differential_fuzz else [])
         ),
         "acceptance_policy": (
-            "semantic-pass-without-counterexample"
+            "tsvc-pass-and-semantic-pass-without-counterexample"
             if args.alive2 or args.differential_fuzz
             else "tsvc-checksum"
         ),
@@ -1492,6 +1501,41 @@ def main() -> int:
                 if record.get("modes", {}).get(mode, {}).get("ok")
                 and int(record.get("modes", {}).get(mode, {}).get("success_iteration", 0)) > 0
             )
+            for mode in modes
+        },
+        "attempt_zero_validation": {
+            mode: {
+                "seeded": sum(
+                    1
+                    for record in records
+                    if record.get("modes", {}).get(mode, {}).get("iterations")
+                    and record["modes"][mode]["iterations"][0].get("candidate_origin") == "seed"
+                ),
+                "tsvc_pass": sum(
+                    1
+                    for record in records
+                    if record.get("modes", {}).get(mode, {}).get("iterations")
+                    and record["modes"][mode]["iterations"][0].get("tsvc_ok")
+                ),
+                "alive2_pass": sum(
+                    1
+                    for record in records
+                    if record.get("modes", {}).get(mode, {}).get("iterations")
+                    and record["modes"][mode]["iterations"][0].get("alive2_status") == "pass"
+                ),
+                "differential_fuzz_pass": sum(
+                    1
+                    for record in records
+                    if record.get("modes", {}).get(mode, {}).get("iterations")
+                    and record["modes"][mode]["iterations"][0].get("differential_fuzz_status") == "pass"
+                ),
+                "accepted": sum(
+                    1
+                    for record in records
+                    if record.get("modes", {}).get(mode, {}).get("iterations")
+                    and record["modes"][mode]["iterations"][0].get("ok")
+                ),
+            }
             for mode in modes
         },
     }

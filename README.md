@@ -335,9 +335,10 @@ and the resulting global state are still compared. Kernel-local `exit` calls are
 captured without intercepting libFuzzer itself: matching termination and exit
 status pass, while return-vs-exit or different exit statuses fail.
 
-When Alive2 and merged-IR fuzzing are enabled, either semantic validator passing
-accepts the candidate and stops self-correction unless the other validator found
-a concrete counterexample. Unsupported Alive2 features and harness/toolchain
+When Alive2 and merged-IR fuzzing are enabled, the TSVC compile/run/checksum must
+pass first. Either semantic validator passing then accepts the candidate and stops
+self-correction unless the other validator found a concrete counterexample.
+Unsupported Alive2 features and harness/toolchain
 failures, including libFuzzer timeouts without a differential mismatch, are
 marked inconclusive rather than blamed on the candidate; if all
 semantic validators are inconclusive and the TSVC run passes, the runner stops
@@ -352,6 +353,11 @@ writing a separate self-correction condition, add:
   --seed-results-dir runs/tsvc_ir_opt/gpt5_top20 \
   --skip-existing
 ```
+Every seeded baseline and guided candidate is copied into attempt zero and rerun
+through TSVC, Alive2, and merged-IR fuzzing. A failed TSVC check or concrete
+Alive2/fuzz counterexample is included in the repair prompt for the next attempt.
+`summary.json` reports the seeded and passing counts under
+`attempt_zero_validation`; pass `--limit 0` to process the complete manifest.
 Generated candidate IR is post-processed before verification to repair common
 LLM syntax issues such as redundant vector operand types, opaque-pointer
 bitcasts, and SSA-assigned constants. Each mode writes `postprocess.json` with
