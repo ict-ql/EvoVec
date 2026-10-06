@@ -325,18 +325,74 @@ def build_and_run_ir(
     }
 
 
+MODULE_DIRECTIVE_PATTERN = re.compile(r'^(target (?:datalayout|triple)\s*=\s*"[^"]*")$', re.MULTILINE)
+METADATA_ATTACHMENT_PATTERN = re.compile(r",\s*![A-Za-z_][A-Za-z0-9_.-]*\s+![0-9]+")
+
+
+def synchronize_module_target(source_ir: str, candidate_ir_path: Path) -> dict[str, Any]:
+    source_directives = {
+        directive.split("=", 1)[0].strip(): directive
+        for directive in MODULE_DIRECTIVE_PATTERN.findall(source_ir)
+    }
+    candidate_ir = candidate_ir_path.read_text(encoding="utf-8", errors="replace")
+    changes: list[dict[str, str | None]] = []
+    for key, source_directive in source_directives.items():
+        pattern = re.compile(rf'^{re.escape(key)}\s*=\s*"[^"]*"$', re.MULTILINE)
+        match = pattern.search(candidate_ir)
+        if match:
+            old_directive = match.group(0)
+            if old_directive != source_directive:
+                candidate_ir = pattern.sub(source_directive, candidate_ir, count=1)
+                changes.append({"directive": key, "old": old_directive, "new": source_directive})
+        else:
+            candidate_ir = f"{source_directive}\n{candidate_ir}"
+            changes.append({"directive": key, "old": None, "new": source_directive})
+    if changes:
+        candidate_ir_path.write_text(candidate_ir, encoding="utf-8")
+    return {"changed": bool(changes), "changes": changes, "path": str(candidate_ir_path)}
+
+
+def normalize_ir_for_alive2(ir_text: str) -> tuple[str, dict[str, int]]:
+    output_lines: list[str] = []
+    removed_metadata_definitions = 0
+    removed_attachments = 0
+    for line in ir_text.splitlines():
+        if line.lstrip().startswith("!"):
+            removed_metadata_definitions += 1
+            continue
+        normalized_line, count = METADATA_ATTACHMENT_PATTERN.subn("", line)
+        removed_attachments += count
+        output_lines.append(normalized_line)
+    return "\n".join(output_lines) + "\n", {
+        "removed_metadata_definitions": removed_metadata_definitions,
+        "removed_metadata_attachments": removed_attachments,
+    }
+
+
 def run_alive2(
     args: argparse.Namespace,
     source_ir_path: Path,
     candidate_ir_path: Path,
+    out_dir: Path,
 ) -> dict[str, Any]:
     if not args.alive2:
         return {"enabled": False, "ok": True, "skipped": True}
+    out_dir.mkdir(parents=True, exist_ok=True)
+    normalized_source, source_normalization = normalize_ir_for_alive2(
+        source_ir_path.read_text(encoding="utf-8", errors="replace")
+    )
+    normalized_candidate, candidate_normalization = normalize_ir_for_alive2(
+        candidate_ir_path.read_text(encoding="utf-8", errors="replace")
+    )
+    normalized_source_path = out_dir / "source.alive2.ll"
+    normalized_candidate_path = out_dir / "candidate.alive2.ll"
+    normalized_source_path.write_text(normalized_source, encoding="utf-8")
+    normalized_candidate_path.write_text(normalized_candidate, encoding="utf-8")
     command = [
         args.alive_tv,
         *args.alive2_arg,
-        str(source_ir_path),
-        str(candidate_ir_path),
+        str(normalized_source_path),
+        str(normalized_candidate_path),
     ]
     result = run_cmd(command, timeout=args.alive2_timeout)
     output = f"{result.get('stdout', '')}\n{result.get('stderr', '')}"
@@ -350,13 +406,24 @@ def run_alive2(
         or re.search(r"\b[1-9]\d* incorrect transformations", output)
         or re.search(r"\b[1-9]\d* failed-to-prove transformations", output)
     )
+    has_counterexample = bool(
+        "doesn't verify" in output
+        or re.search(r"\b[1-9]\d* incorrect transformations", output)
+    )
     result["enabled"] = True
+    result["source_ir"] = str(normalized_source_path)
+    result["candidate_ir"] = str(normalized_candidate_path)
+    result["normalization"] = {
+        "source": source_normalization,
+        "candidate": candidate_normalization,
+    }
     result["verified"] = bool(
         result["ok"]
         and any(marker in output for marker in success_markers)
         and not has_failure
     )
     result["ok"] = result["verified"]
+    result["status"] = "pass" if result["verified"] else ("fail" if has_counterexample else "inconclusive")
     return result
 
 
@@ -368,7 +435,7 @@ def validate_ir_candidate(
     out_dir: Path,
     expected_checksum: float,
 ) -> dict[str, Any]:
-    alive2_result = run_alive2(args, source_ir_path, candidate_ir_path)
+    alive2_result = run_alive2(args, source_ir_path, candidate_ir_path, out_dir / "alive2")
     differential_result = build_and_run_ir(args, task, candidate_ir_path, out_dir, expected_checksum)
     if args.differential_fuzz:
         from neural_asm_pipeline.differential_fuzz import run_differential_fuzz
@@ -391,18 +458,39 @@ def validate_ir_candidate(
             command_runner=run_cmd,
         )
     else:
-        fuzz_result = {"enabled": False, "ok": True, "skipped": True}
+        fuzz_result = {"enabled": False, "ok": True, "status": "disabled", "skipped": True}
     methods = ["reference-oracle-checksum-differential"]
     if args.alive2:
         methods.insert(0, "alive2")
     if args.differential_fuzz:
         methods.append("libfuzzer-merged-ir-differential")
+    semantic_statuses: list[str] = []
+    if args.alive2:
+        semantic_statuses.append(str(alive2_result.get("status") or "inconclusive"))
+    if args.differential_fuzz:
+        semantic_statuses.append(str(fuzz_result.get("status") or "inconclusive"))
+    has_semantic_failure = "fail" in semantic_statuses
+    has_semantic_pass = "pass" in semantic_statuses
+    accepted = (
+        has_semantic_pass and not has_semantic_failure
+        if semantic_statuses
+        else bool(differential_result["ok"])
+    )
+    repairable = bool(
+        has_semantic_failure
+        or not differential_result.get("compile", {}).get("ok")
+        or not differential_result.get("run", {}).get("ok")
+        or not differential_result.get("checksum_ok")
+    )
     return {
         "methods": methods,
+        "acceptance_policy": "semantic-pass-without-counterexample" if semantic_statuses else "tsvc-checksum",
+        "semantic_statuses": semantic_statuses,
+        "repairable": repairable,
         "alive2": alive2_result,
         "differential": differential_result,
         "differential_fuzz": fuzz_result,
-        "ok": bool(alive2_result["ok"] and differential_result["ok"] and fuzz_result["ok"]),
+        "ok": accepted,
     }
 
 
@@ -417,9 +505,12 @@ def repair_verifier_feedback(result: dict[str, Any]) -> dict[str, Any]:
     fuzz_stage_result = (fuzz_result.get("stages") or {}).get(fuzz_stage) or {}
     return {
         "ok": bool(result.get("ok")),
+        "acceptance_policy": result.get("acceptance_policy"),
+        "repairable": result.get("repairable"),
         "alive2": {
             "enabled": bool(alive2_result.get("enabled")),
             "ok": bool(alive2_result.get("ok")),
+            "status": alive2_result.get("status"),
             "returncode": alive2_result.get("returncode"),
             "stdout": alive2_result.get("stdout", ""),
             "stderr": alive2_result.get("stderr", ""),
@@ -445,6 +536,7 @@ def repair_verifier_feedback(result: dict[str, Any]) -> dict[str, Any]:
         "differential_fuzz": {
             "enabled": bool(fuzz_result.get("enabled", bool(fuzz_result))),
             "ok": bool(fuzz_result.get("ok")),
+            "status": fuzz_result.get("status"),
             "stage": fuzz_stage or None,
             "returncode": fuzz_stage_result.get("returncode"),
             "stdout": fuzz_stage_result.get("stdout", ""),
@@ -908,10 +1000,12 @@ def run_mode(
             candidate_ir_path.write_text(candidate_ir, encoding="utf-8")
         postprocess_summary = postprocess_ir_if_enabled(args, candidate_ir_path)
         postprocess_path.write_text(json.dumps(postprocess_summary, indent=2), encoding="utf-8")
+        module_target_sync = synchronize_module_target(scalar_ir, candidate_ir_path)
         attr_patch = patch_target_attributes_if_enabled(args, candidate_ir_path)
         if existing_llm_result is not None:
             attr_patch["skipped_existing_generation"] = True
         attempt["ir_postprocess"] = postprocess_summary
+        attempt["module_target_sync"] = module_target_sync
         attempt["target_attribute_patch"] = attr_patch
 
         if args.generate_only:
@@ -936,6 +1030,8 @@ def run_mode(
         attempt.update(
             {
                 "ok": verify_result["ok"],
+                "repairable": verify_result["repairable"],
+                "semantic_statuses": verify_result["semantic_statuses"],
                 "alive2_ok": verify_result["alive2"]["ok"],
                 "differential_fuzz_ok": verify_result["differential_fuzz"]["ok"],
                 "compile_ok": differential_result["compile"]["ok"],
@@ -961,6 +1057,10 @@ def run_mode(
         record["ok"] = bool(attempt["ok"])
         if attempt["ok"]:
             record["success_iteration"] = iteration
+            break
+        if not verify_result["repairable"]:
+            record["verifier_inconclusive"] = True
+            record["error"] = "semantic validators were inconclusive; candidate repair was not attempted"
             break
         previous_candidate = candidate_ir_path.read_text(encoding="utf-8", errors="replace")
         previous_verify = verify_result
@@ -1356,6 +1456,11 @@ def main() -> int:
             (["alive2"] if args.alive2 else [])
             + ["reference-oracle-checksum-differential"]
             + (["libfuzzer-merged-ir-differential"] if args.differential_fuzz else [])
+        ),
+        "acceptance_policy": (
+            "semantic-pass-without-counterexample"
+            if args.alive2 or args.differential_fuzz
+            else "tsvc-checksum"
         ),
         "differential_fuzz": {
             "enabled": args.differential_fuzz,

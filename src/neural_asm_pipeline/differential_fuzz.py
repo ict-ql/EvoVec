@@ -32,6 +32,27 @@ def rename_llvm_symbol(ir_text: str, old_name: str, new_name: str) -> str:
     return pattern.sub(f"@{new_name}", ir_text)
 
 
+def infer_tsvc_dimensions(ir_text: str) -> tuple[int, int]:
+    one_dimensional = re.search(
+        r"^@(?:a|x)\s*=.*?\[(\d+) x (?:float|double)\]",
+        ir_text,
+        re.MULTILINE,
+    )
+    two_dimensional = re.search(
+        r"^@aa\s*=.*?\[(\d+) x \[(\d+) x (?:float|double)\]\]",
+        ir_text,
+        re.MULTILINE,
+    )
+    if not one_dimensional or not two_dimensional:
+        raise ValueError("could not infer TSVC dimensions from scalar IR globals")
+    len_1d = int(one_dimensional.group(1))
+    outer_len = int(two_dimensional.group(1))
+    inner_len = int(two_dimensional.group(2))
+    if outer_len != inner_len:
+        raise ValueError(f"expected square TSVC 2D arrays, found {outer_len}x{inner_len}")
+    return len_1d, outer_len
+
+
 def render_fuzz_harness(kernel: str, arg_expr: str, len_1d: int, len_2d: int) -> str:
     template = r'''#include <stddef.h>
 #include <stdint.h>
@@ -324,15 +345,37 @@ def run_differential_fuzz(
     out_dir.mkdir(parents=True, exist_ok=True)
     source_ir = source_ir_path.read_text(encoding="utf-8", errors="replace")
     candidate_ir = candidate_ir_path.read_text(encoding="utf-8", errors="replace")
+    try:
+        len_1d, len_2d = infer_tsvc_dimensions(source_ir)
+    except ValueError as exc:
+        return {
+            "enabled": True,
+            "ok": False,
+            "status": "inconclusive",
+            "error": str(exc),
+            "stage": "inspect_source",
+        }
     prefixed_source, source_mapping = prefix_defined_functions(source_ir, "__comagent_ref_")
     prefixed_candidate, candidate_mapping = prefix_defined_functions(candidate_ir, "__comagent_candidate_")
     prefixed_source = rename_llvm_symbol(prefixed_source, "exit", "__comagent_fuzz_exit")
     prefixed_candidate = rename_llvm_symbol(prefixed_candidate, "exit", "__comagent_fuzz_exit")
     kernel = str(task["kernel"])
     if kernel not in source_mapping:
-        return {"ok": False, "error": f"reference IR does not define {kernel}", "stage": "rename"}
+        return {
+            "enabled": True,
+            "ok": False,
+            "status": "inconclusive",
+            "error": f"reference IR does not define {kernel}",
+            "stage": "rename",
+        }
     if kernel not in candidate_mapping:
-        return {"ok": False, "error": f"candidate IR does not define {kernel}", "stage": "rename"}
+        return {
+            "enabled": True,
+            "ok": False,
+            "status": "fail",
+            "error": f"candidate IR does not define {kernel}",
+            "stage": "rename",
+        }
 
     source_prefixed_path = out_dir / "reference.prefixed.ll"
     candidate_prefixed_path = out_dir / "candidate.prefixed.ll"
@@ -346,8 +389,8 @@ def run_differential_fuzz(
         render_fuzz_harness(
             kernel,
             str(task.get("arg_expr") or "NULL"),
-            int(task.get("len_1d") or 320),
-            int(task.get("len_2d") or 32),
+            len_1d,
+            len_2d,
         ),
         encoding="utf-8",
     )
@@ -436,6 +479,7 @@ def _fuzz_result(
     return {
         "enabled": True,
         "ok": ok,
+        "status": "pass" if ok else ("fail" if stage == "fuzz" else "inconclusive"),
         "stage": stage,
         "stages": stages,
         "combined_ir": str(combined_ir_path),

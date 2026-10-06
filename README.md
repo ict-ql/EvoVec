@@ -326,10 +326,20 @@ harness, and uses `llvm-link` to produce one `combined.ll`. The harness replaces
 `initialise_arrays` with deterministic input decoding, resets identical state
 before each implementation, and compares return values, argument state, all
 TSVC global arrays, `indx`, `xx`, and `yy` bit-for-bit. The default budget is
-1,000 generated inputs per candidate; use `--fuzz-runs` to raise it. All enabled
-checks must pass before the repair loop stops. Kernel-local `exit` calls are
+1,000 generated inputs per candidate; use `--fuzz-runs` to raise it. TSVC array
+dimensions are inferred from the scalar IR and checked against the support
+headers instead of trusting possibly stale manifest dimensions. Kernel-local `exit` calls are
 captured without intercepting libFuzzer itself: matching termination and exit
 status pass, while return-vs-exit or different exit statuses fail.
+
+When Alive2 and merged-IR fuzzing are enabled, either semantic validator passing
+accepts the candidate and stops self-correction unless the other validator found
+a concrete counterexample. Unsupported Alive2 features and harness/toolchain
+failures are marked inconclusive rather than blamed on the candidate; if all
+semantic validators are inconclusive and the TSVC run passes, the runner stops
+without spending another repair attempt. The TSVC checksum remains an independent
+diagnostic and performance-harness result. If neither semantic validator is
+enabled, the TSVC checksum remains the acceptance condition.
 
 To reuse attempt-zero generations from an earlier result directory while
 writing a separate self-correction condition, add:

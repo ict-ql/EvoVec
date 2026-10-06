@@ -8,7 +8,8 @@ Goal:
 Non-negotiable output rules:
 - Output one complete LLVM IR module only.
 - Do not output Markdown fences, prose, JSON, analysis, or build commands.
-- The module must be accepted by LLVM clang for target triple `{target}`.
+- The module must be accepted by LLVM clang.
+- Preserve the original module's target datalayout, target triple, function attributes, and ABI exactly instead of inventing or substituting target metadata.
 - Preserve all externally visible function names, global objects, function signatures, calling conventions, and observable behavior from the original module.
 - Do not weaken correctness with undefined behavior, poison, out-of-bounds accesses, invalid alignment claims, or unsupported target features.
 
@@ -20,11 +21,7 @@ Optimization objective:
 Experiment metadata:
 - Mode: {mode}
 - Kernel: {kernel}
-- LLVM target CPU: {target_cpu}
-- CPU model: {target_cpu_name}
-- Target triple: {target}
 - Repair attempt: {iteration} of {max_iterations}
-{target_notes}
 
 Original scalar LLVM IR:
 ```llvm
