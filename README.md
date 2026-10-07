@@ -652,6 +652,10 @@ python3 scripts/build_x86_intrinsic_alias_map.py \
   --out runs/instruction_semantics/x86_llvm_aliases.json
 ```
 
+Wrapper compilation is best-effort by default: incompatible intrinsics are
+isolated and recorded in `x86_llvm_aliases.skipped.json` while all compilable
+wrappers still contribute aliases. Pass `--strict` for all-or-nothing behavior.
+
 For the dual-graph retriever, train with a program graph directory and an
 instruction graph directory:
 

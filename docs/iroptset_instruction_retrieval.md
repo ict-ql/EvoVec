@@ -183,6 +183,11 @@ python3 scripts/build_x86_intrinsic_alias_map.py \
   --out runs/instruction_semantics/x86_llvm_aliases.json
 ```
 
+Compilation uses best-effort batches so one unsupported intrinsic does not
+discard the complete map. Skipped wrappers and their clang diagnostics are
+written next to the alias map with the suffix `.skipped.json`; use `--strict`
+to request the former all-or-nothing behavior.
+
 For RVV, use RVV intrinsic/spec tables. Store only the normalized JSONL records
 in this repo so the model sees a stable schema rather than page-specific
 formatting.
