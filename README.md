@@ -656,6 +656,25 @@ Wrapper compilation is best-effort by default: incompatible intrinsics are
 isolated and recorded in `x86_llvm_aliases.skipped.json` while all compilable
 wrappers still contribute aliases. Pass `--strict` for all-or-nothing behavior.
 
+Build dependency-free text-retrieval recommendations for TSVC from only the
+compiled alias map and Intel XML descriptions:
+
+```bash
+python3 scripts/build_tsvc_text_retrieval_recommendations.py \
+  --xml /path/to/data-latest.xml \
+  --alias-map runs/ablation/intel_to_llvm_aliases.json \
+  --summaries /path/to/IR_summaries.zip \
+  --method bm25 \
+  --top-k 20 \
+  --out-jsonl runs/ablation/bm25/recommendations.jsonl
+```
+
+The output JSONL is accepted by `run_tsvc_ir_optimization_experiment.py` via
+`--recommendations-jsonl`. Use `--method random --seed N` for reproducible
+random hints, or `--method full` for the complete mapped Intel list. These
+retriever ablations should use `--max-iters 1`; for the full-list condition,
+also set `--recommendation-top-k` to the corpus size reported by the builder.
+
 For the dual-graph retriever, train with a program graph directory and an
 instruction graph directory:
 
