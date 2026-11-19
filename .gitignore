@@ -1,5 +1,50 @@
+# Python caches and local environments
 __pycache__/
 *.py[cod]
-runs/
-tmp/
-cmd.log
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+.venv/
+venv/
+*.egg-info/
+
+# Generated experiment artifacts
+/runs/
+/outputs/
+/tmp/
+/checkpoints/
+/wandb/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.log
+
+# Local credentials and configuration
+.env
+.env.*
+!.env.example
+/config/llm.yaml
+/config/llm.local.*
+
+# Build products
+/build/
+/dist/
+*.o
+*.obj
+*.so
+*.dll
+*.dylib
+*.exe
+
+# Editor and operating-system files
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+Desktop.ini
+*.swp
+*.swo
+*~

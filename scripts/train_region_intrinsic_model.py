@@ -19,7 +19,7 @@ try:
         subgraph_symbolic,
     )
     from mini_programl_graphs import encode_graph, parse_program_ir_to_graph
-    from train_instruction_dual_gnn import (
+    from graph_encoder import (
         RelationalGraphEncoder,
         batch_graphs,
         encode_all,
@@ -35,7 +35,7 @@ except ModuleNotFoundError:  # pragma: no cover - used when imported as a packag
         subgraph_symbolic,
     )
     from scripts.mini_programl_graphs import encode_graph, parse_program_ir_to_graph
-    from scripts.train_instruction_dual_gnn import (
+    from scripts.graph_encoder import (
         RelationalGraphEncoder,
         batch_graphs,
         encode_all,

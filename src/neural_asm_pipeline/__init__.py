@@ -1,4 +1,4 @@
-"""Utilities for LLM-as-compiler experiments."""
+"""Utilities for retrieval-guided LLVM IR optimization and validation."""
 
 __all__ = ["__version__"]
 

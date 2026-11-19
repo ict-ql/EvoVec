@@ -11,7 +11,7 @@ import subprocess
 from typing import Any
 
 try:
-    from label_iroptset_instructions import (
+    from intrinsic_labels import (
         DEFAULT_EXCLUDE_INTRINSIC_PREFIXES,
         extract_intrinsic_counts,
     )
@@ -28,7 +28,7 @@ try:
         write_jsonl,
     )
 except ModuleNotFoundError:  # pragma: no cover - used when imported as a package module
-    from scripts.label_iroptset_instructions import (
+    from scripts.intrinsic_labels import (
         DEFAULT_EXCLUDE_INTRINSIC_PREFIXES,
         extract_intrinsic_counts,
     )

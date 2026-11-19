@@ -1,213 +1,114 @@
-# LLM Compiler Replacement Pipeline
+# EvoVec
 
-This project scaffolds an experiment where an LLM or agent acts as the compiler
-under test:
+EvoVec is a retrieval-augmented LLM vectorization framework for evolving
+instruction sets. A dual-encoder retriever matches scalar LLVM IR regions to
+instruction semantic graphs. Selected intrinsic names and exact signatures guide
+the LLM to generate optimized LLVM IR; Clang compiles and links the result.
 
 ```text
-source code or LLVM IR -> LLM compiler agent -> target assembly -> assembler/linker -> tests
+LLVM vectorization tests --> diff-supervised region graphs --> retriever training
+ISL instruction descriptions --> instruction semantic graphs ----^
+
+scalar C --> scalar LLVM IR --> region extraction --> instruction retrieval
+         --> LLM IR optimization --> validation --> TSVC timing
+                                    |
+                                    +--> validator feedback --> IR repair
 ```
 
-Conventional compilers are used only for baselines, reference behavior, optional
-LLVM IR normalization, and assembly/link/test tooling. They are not the code
-generator in the experimental path.
+Instruction semantics are used by the retriever. The generation prompt supplies
+selected intrinsic names and signatures.
 
-## Research Modes
+## Requirements and setup
 
-1. **Full compiler replacement**
-   - Input: C or Fortran source.
-   - Output: target assembly.
-   - Claim: the LLM replaces frontend analysis, optimization, and backend code
-     generation for the selected benchmark scope.
-
-2. **Backend replacement**
-   - Input: LLVM IR.
-   - Output: target assembly.
-   - Claim: the LLM replaces instruction selection, register allocation, and
-     target lowering. This is the more controlled first milestone.
-
-## Initial Benchmarks
-
-- **NPB**: NAS Parallel Benchmarks for Fortran/HPC kernels and whole programs.
-- **TSVC**: vectorization kernels for loop optimization and SIMD-sensitive code.
-
-Use local copies of the suites so licensing and versioning stay explicit.
+Experiments target Linux with Bash and Python 3.10 or newer. Install PyTorch
+(with CUDA support for GPU training), the `openai` package for generation, and
+`PyYAML` for YAML configuration:
 
 ```bash
-python3 scripts/prepare_benchmarks.py \
-  --suite tsvc \
-  --root /path/to/TSVC \
-  --out runs/manifests/tsvc.jsonl
+python3 -m venv .venv
+source .venv/bin/activate
+python3 -m pip install torch openai pyyaml
 
-python3 scripts/prepare_benchmarks.py \
-  --suite npb \
-  --root /path/to/NPB3.x \
-  --out runs/manifests/npb.jsonl
+export LLVM_PROJECT_ROOT=/path/to/llvm-project
+export LLVM_BUILD_DIR="$LLVM_PROJECT_ROOT/build"
+export PATH="$LLVM_BUILD_DIR/bin:$PATH"
+export ALIVE_TV=/path/to/alive2/build/alive-tv
+export OPENAI_API_KEY='your-api-key'
+cp config/llm.example.yaml config/llm.yaml
 ```
 
-## Source Computation Graph Example
+Use LLVM 19.1.0 tools (`clang`, `opt`, `llvm-link`, `llvm-config`), LLVM
+sources and development libraries, a C++ compiler for declaration resolution,
+and GCC for reference binaries. ICX is optional for compiler comparisons.
+Formal validation needs a compatible Alive2 build; differential testing needs
+Clang's libFuzzer and AddressSanitizer runtimes.
 
-The GNN input graph is built from LLVM IR, not from generated assembly. The
-default representation is `mini-programl`: a small ProGraML-style directed
-multigraph with `INSTRUCTION`, `VARIABLE`, `CONSTANT`, and `TYPE` nodes.
-Edges have ProGraML-like `control`, `data`, or `type` flow, plus numeric
-positions and lightweight features such as `backedge`. We omit call edges
-because this experiment is function/intrinsic retrieval oriented.
+Install the PyTorch build appropriate for your GPU. Dependencies are not pinned
+to an archived release environment. All commands below run from the repository
+root.
 
-For a small function:
+The example configuration selects `gpt-5`. Blank credentials and base URL defer
+to `OPENAI_API_KEY` and `OPENAI_BASE_URL`. Private `config/llm.yaml` is ignored
+by Git. Generation commands incur API costs; training, retrieval, saved-candidate
+validation, and timing do not call the LLM.
 
-```llvm
-define i32 @scale_sum(i32 %a, i32 %b) {
-entry:
-  %x = add i32 %a, %b
-  %y = mul i32 %x, 4
-  ret i32 %y
-}
-```
+## Repository layout
 
-`scripts/build_mini_programl_graph.py` turns it into a symbolic graph. The
-checked-in example is:
+| Path | Purpose |
+| --- | --- |
+| `scripts/build_llvm_vectorize_region_dataset.py` | Diff-supervised region dataset |
+| `scripts/build_instruction_semantic_graphs.py` | Instruction semantic graphs |
+| `scripts/train_region_intrinsic_model.py` | Region-change and instruction-matching training |
+| `scripts/run_tsvc_region_inference.py` | TSVC scalar IR and recommendations |
+| `scripts/resolve_llvm_intrinsic_declarations.py` | Exact intrinsic signatures |
+| `scripts/run_tsvc_ir_optimization_experiment.py` | IR generation, validation, and repair |
+| `scripts/benchmark_tsvc_correct_candidates.py` | TSVC timing of accepted candidates |
+| `scripts/run_tsvc_compiler_baselines.py` | GCC, LLVM, and ICX baselines |
+| `scripts/build_tsvc_text_retrieval_recommendations.py` | BM25, random, and full-list hints |
+| `scripts/rebuild_tsvc_records.py` | Rebuild records from saved results |
+| `prompts/` | English IR generation and repair templates |
+| `src/neural_asm_pipeline/` | Shared LLM, IR, target, and fuzzing utilities |
+| `examples/` | LLVM IR, GEMM, and instruction-semantic examples |
+| `third_party/TSVC_2/src/` | TSVC sources used to construct harnesses |
+| `runs/` | Generated datasets, checkpoints, candidates, and logs; Git-ignored |
 
-```text
-examples/program_graph/scale_sum.graph.json
-```
+The shared package retains its historical name `neural_asm_pipeline` for import
+compatibility. Shared graph encoders and intrinsic-label extraction utilities are
+in `scripts/graph_encoder.py` and `scripts/intrinsic_labels.py`, respectively.
 
-Regenerate it with:
-
-```bash
-python3 scripts/inspect_program_graph.py \
-  --ir-file examples/program_graph/scale_sum.ll \
-  --out examples/program_graph/scale_sum.graph.json
-```
-
-The same standalone parser is the inference-time entry point:
-
-```bash
-python3 scripts/build_mini_programl_graph.py \
-  --mode program \
-  --ir-file examples/program_graph/scale_sum.ll \
-  --vocab runs/iroptset/graphs/pilot_10k_v1/vocab.json \
-  --out runs/inference/scale_sum.program_graph.json
-```
-
-Compact symbolic output interns each normalized type as one `type` node. Only
-that node keeps `data_type`; typed variables, constants, and instructions point
-to it with `type` edges. SSA names such as `%x`, `%y`, `%1`, and `%2` are
-debug-only text, while trainable variable tokens stay canonical as `var`.
-
-Readable sketch:
-
-```text
-nodes
-  0  variable     %a
-  1  variable     %b
-  2  type         i32
-  3  instruction  add
-  4  variable     %x
-  5  instruction  mul
-  6  variable     %y
-  7  constant     4
-  8  instruction  ret
-
-edges
-  i32 -> %a                type
-  i32 -> %b                type
-  i32 -> add               type
-  add -> %x                data(position=0, role=def)
-  i32 -> %x                type
-  %a -> add                data(position=0, role=use)
-  %b -> add                data(position=1, role=use)
-  add -> mul               control
-  i32 -> mul               type
-  mul -> %y                data(position=0, role=def)
-  i32 -> %y                type
-  %x -> mul                data(position=0, role=use)
-  i32 -> 4                 type
-  4 -> mul                 data(role=constant)
-  mul -> ret               control
-  i32 -> ret               type
-  %y -> ret                data(position=0, role=use)
-```
-
-The encoded dataset stores token IDs, node type IDs, typed directed edges, and
-edge positions. Loops are visible as control-flow cycles; backedges are marked
-in edge features when a terminator branches to an earlier block.
-
-Training currently tensorizes only these graph fields into the GNN encoder:
-
-```text
-node_token_ids      -> node_tokens
-node_type_ids       -> node_types
-edges[:, 0]         -> edge_src
-edges[:, 1]         -> edge_dst
-edges[:, 2]         -> edge_types
-edges[:, 3]         -> edge_positions
-edge_feature_ids    -> edge_features
-edge_counts         -> edge_counts
-```
-
-`graph_ids` is created during batching for graph-level pooling, and `label_ids`
-is used as retrieval supervision. Symbolic inspection fields such as
-`node_features`, `graph_features`, `node_tokens`, `node_types`, and
-`edge_features` are not consumed by the trainer unless they are first encoded
-into the tensor fields above.
-
-For the paper path, do not train instruction recommendation from function-level
-bags. Use before/after graph diffs to extract changed scalar regions, then train
-a changed-region detector and an intrinsic matcher on those regions. The
-function-level dual-graph trainer is kept only as a pilot baseline until the
-diff-supervised region dataset is built.
-
-Start with LLVM's focused X86 vectorizer tests rather than IR-OptSet:
+## 1. Build data and train the retriever
 
 ```bash
 python3 scripts/build_llvm_vectorize_region_dataset.py \
-  --llvm-project-root /path/to/llvm-project \
-  --opt /path/to/llvm-project/build/bin/opt \
+  --llvm-project-root "$LLVM_PROJECT_ROOT" \
+  --opt "$LLVM_BUILD_DIR/bin/opt" \
   --out-dir runs/llvm_vectorize_regions/x86_v1
-```
 
-The script reads:
-
-```text
-llvm/test/Transforms/LoopVectorize/X86
-llvm/test/Transforms/SLPVectorizer/X86
-```
-
-It runs `opt`, extracts changed scalar regions from before/after IR graph
-diffs, emits train/val/test `.regions.jsonl`, and writes synthetic instruction
-specs for observed vector IR operations and LLVM intrinsic labels:
-
-```text
-runs/llvm_vectorize_regions/x86_v1/vector_instruction_specs.jsonl
-```
-
-Region proposals are store-rooted by default: each store instruction seeds a
-backward data slice that pulls in the address/value computation feeding the
-write. When the slice reaches a `phi`, the graph includes that `phi` node's
-control-flow predecessor edges, so loop backedges can appear inside the
-store-rooted region without creating a separate loop-level candidate. The older
-producer-consumer and whole loop/backedge proposers are still available for
-debugging or ablation, but they are not the default because they either cut
-computations too finely or make regions too coarse.
-
-Generic `llvm.vector.load.*` and `llvm.vector.store.*` labels are excluded from
-supervised targets by default. They remain as graph nodes inside regions and
-instruction micro-operation graphs, but they are not useful top-level
-recommendations. Pass `--keep-memory-target-labels` only for debugging the
-closed-set vectorizer behavior.
-
-Build instruction graphs for those observed labels:
-
-```bash
 python3 scripts/build_instruction_semantic_graphs.py \
   --spec-jsonl runs/llvm_vectorize_regions/x86_v1/vector_instruction_specs.jsonl \
   --out-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs
+
+python3 scripts/train_region_intrinsic_model.py \
+  --region-dir runs/llvm_vectorize_regions/x86_v1 \
+  --instruction-graph-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs \
+  --out-dir runs/llvm_vectorize_regions/models/x86_v1 \
+  --epochs 100 --batch-size 32 --layers 3 --hidden-dim 128 \
+  --dropout 0.15 --lr 0.001 --weight-decay 0.0001
 ```
 
-Do not include zero-shot target instructions, such as AMX, in the training
-instruction graph directory. Keep training on observed vectorizer labels only.
-For inference, build a separate instruction graph directory that appends AMX to
-the candidate set:
+The builder uses the LLVM LoopVectorize and SLPVectorizer X86 test directories
+by default. Before/after IR differences provide region-change labels and target
+instructions. Splitting uses source path and function name: all regions from a
+function stay together. All positive regions and at most eight negative regions
+per function are retained; this caps negatives without enforcing class balance.
+
+Generated instruction specs cover observed vector operations and fallback
+intrinsic labels. For supported x86 intrinsics, import external Intel/Vegen XML
+using `scripts/import_intel_intrinsics_xml.py` and include the resulting specs
+alongside the generated JSONL in `--spec-jsonl`. Consult its `--help` for options.
+External XML data, generated datasets, and trained checkpoints are not bundled.
+
+For the held-out AMX case study, build a separate inference candidate directory:
 
 ```bash
 python3 scripts/build_instruction_semantic_graphs.py \
@@ -217,565 +118,173 @@ python3 scripts/build_instruction_semantic_graphs.py \
   --out-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs_with_amx
 ```
 
-The synthetic specs cover generic LLVM vector ops, reductions, and common
-fallback intrinsic labels such as vector libm and overflow intrinsics. If the
-collected labels include real `llvm.x86.*` intrinsics, pass the imported
-Intel/Vegen intrinsic spec JSONL in the same `--spec-jsonl` list so those labels
-use real target-instruction semantics instead of a generic fallback.
+Keep AMX out of the training graphs. Held out refers to retriever training, not
+LLM pretraining. The paper used 313 candidate graphs (311 entries plus two AMX
+instructions); rebuilding with different specs can change that count.
 
-The semantic retrieval path uses generic instruction root tokens by default. It
-prevents the instruction label itself, such as `llvm.vector.add.v4xi32` or an
-AMX intrinsic name, from becoming a trainable node token. The label remains in
-metadata, while the GNN sees the operation graph. This is important for
-zero-shot candidate instructions whose labels never appear as training targets.
-Use `--root-token-mode label` only for closed-set debugging.
-
-Then train the changed-region detector plus intrinsic/vector-op matcher:
-
-```bash
-python3 scripts/train_region_intrinsic_model.py \
-  --region-dir runs/llvm_vectorize_regions/x86_v1 \
-  --instruction-graph-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs \
-  --out-dir runs/llvm_vectorize_regions/models/region_intrinsic_x86_v1
-```
-
-To inspect recommendations on pre-vectorization TSVC IR, first emit scalar IR
-with LLVM vectorizers disabled, then run the retriever:
-
-```bash
-clang -S -emit-llvm -O3 -fno-vectorize -fno-slp-vectorize \
-  -I runs/tsvc_kernels/v1/support \
-  runs/tsvc_kernels/v1/kernels/s000/reference_kernel.c \
-  -o runs/tsvc_prevec_ir/s000.ll
-
-python3 scripts/recommend_region_intrinsics.py \
-  --ir-file runs/tsvc_prevec_ir/s000.ll \
-  --checkpoint runs/llvm_vectorize_regions/models/region_intrinsic_x86_v1/best.pt \
-  --instruction-graph-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs \
-  --out-jsonl runs/llvm_vectorize_regions/recommendations/s000.jsonl \
-  --out-md runs/llvm_vectorize_regions/recommendations/s000.md \
-  --top-k 10 \
-  --device cuda
-```
-
-For all split TSVC kernels, use the batch wrapper. It emits scalar IR for each
-kernel in `runs/manifests/tsvc_kernels.jsonl`, then keeps the top 20
-recommendations per candidate region. On a remote Ubuntu server, regenerate the
-manifest on that server so the absolute paths point to the remote checkout; if
-you copied a manifest from another machine, pass `--tsvc-root` with the remote
-`runs/tsvc_kernels/v1` path.
+## 2. Prepare TSVC and retrieve hints
 
 ```bash
 python3 scripts/prepare_tsvc_kernels.py \
   --src-dir third_party/TSVC_2/src \
   --out-dir runs/tsvc_kernels/v1 \
   --manifest runs/manifests/tsvc_kernels.jsonl \
-  --kernels all
+  --kernels all --iterations 100000
 
 python3 scripts/run_tsvc_region_inference.py \
   --manifest runs/manifests/tsvc_kernels.jsonl \
   --tsvc-root runs/tsvc_kernels/v1 \
-  --checkpoint runs/llvm_vectorize_regions/models/region_intrinsic_x86_v1/best.pt \
+  --checkpoint runs/llvm_vectorize_regions/models/x86_v1/last.pt \
   --instruction-graph-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs \
   --out-dir runs/tsvc_region_recommendations/top20 \
-  --top-k 20 \
-  --device cuda
+  --clang "$LLVM_BUILD_DIR/bin/clang" --top-k 20 --device cuda
+
+python3 scripts/resolve_llvm_intrinsic_declarations.py \
+  --llvm-project-root "$LLVM_PROJECT_ROOT" \
+  --llvm-config "$LLVM_BUILD_DIR/bin/llvm-config" \
+  --recommendations-jsonl runs/tsvc_region_recommendations/top20/recommendations.jsonl \
+  --recommendation-top-k 20 \
+  --out-json runs/llvm_intrinsics/tsvc_top20_declarations.json
 ```
 
-To test whether recommendation-guided IR optimization improves TSVC runtime,
-run the baseline and guided LLM paths side by side. The baseline prompt receives
-only pre-vectorization LLVM IR; the guided prompt receives the same IR plus the
-top recommendation rows from the retriever. Both paths must return complete
-LLVM IR, which is linked into the existing TSVC harness and checked by checksum:
+Use the same prepared kernel tree for all comparisons. Preparation defaults to
+four iterations for smoke checks; specify `--iterations 100000` for the paper's
+setting. Each kernel retains its original loop formula based on this parameter.
+Regenerate manifests on the execution machine or use `--tsvc-root` to relocate
+kernel paths.
+
+## 3. Generate, validate, and repair IR
+
+This command compares unguided GPT-5 (`baseline`) with retrieval guidance
+(`guided`) under Pass@1. Set `--limit 1` for a smoke run; `--limit 0` runs all
+kernels.
 
 ```bash
 python3 scripts/run_tsvc_ir_optimization_experiment.py \
   --manifest runs/manifests/tsvc_kernels.jsonl \
   --tsvc-root runs/tsvc_kernels/v1 \
   --recommendations-jsonl runs/tsvc_region_recommendations/top20/recommendations.jsonl \
-  --out-dir runs/tsvc_ir_opt/gpt5_top20_alive2_diff_5 \
-  --llm-config config/llm.example.yaml \
-  --model gpt-5 \
-  --max-tokens 16000 \
-  --temperature 0.2 \
-  --modes baseline,guided \
-  --limit 10 \
-  --max-iters 5 \
-  --alive2 \
-  --alive-tv /path/to/alive-tv \
-  --differential-fuzz \
-  --llvm-link /path/to/llvm-link \
-  --fuzz-runs 10000 \
-  --target-cpu auto \
-  --clang clang \
-  --cc cc
+  --intrinsic-declarations-json runs/llvm_intrinsics/tsvc_top20_declarations.json \
+  --out-dir runs/tsvc_ir_opt/gpt5_top20_pass1 \
+  --llm-config config/llm.yaml --model gpt-5 --max-tokens 16000 \
+  --modes baseline,guided --limit 0 --max-iters 1 \
+  --alive2 --alive-tv "$ALIVE_TV" \
+  --differential-fuzz --llvm-link "$LLVM_BUILD_DIR/bin/llvm-link" \
+  --clang "$LLVM_BUILD_DIR/bin/clang" --cc gcc \
+  --fuzz-runs 10000 --fuzz-input-timeout 5 --fuzz-timeout 1800 \
+  --run-timeout 300 --jobs 8 \
+  --skip-scalar-ir-eval --skip-existing --resume-completed
 ```
 
-The exact prompts, model outputs, compile/run logs, and per-kernel records are
-written under the output directory. Each mode gets at most five attempts by
-default: the initial generation followed by fixed-template self-correction using
-only the previous candidate and normalized validator feedback. Attempt zero
-keeps the original directory layout; later attempts are stored in `iter_01`
-through `iter_04`. `summary.json` reports pass@1, within-budget success,
-self-correction recoveries, mean times, and paired guided-vs-baseline speedup.
-The executable check is a differential test against the reference program's
-checksum. With `--alive2`, a candidate must also refine the original scalar IR
-according to `alive-tv`. With `--differential-fuzz`, the runner prefixes every
-defined reference and candidate function, compiles a per-kernel libFuzzer
-harness, and uses `llvm-link` to produce one `combined.ll`. The harness replaces
-`initialise_arrays` with deterministic input decoding, resets identical state
-before each implementation, and compares return values, argument state, all
-TSVC global arrays, `indx`, `xx`, and `yy` bit-for-bit. The default budget is
-1,000 generated inputs per candidate; use `--fuzz-runs` to raise it. TSVC array
-dimensions are inferred from the scalar IR and checked against the support
-headers instead of trusting possibly stale manifest dimensions. To avoid running
-the benchmark timing loop thousands of times per fuzz input, `dummy` ends each
-implementation after three completed benchmark iterations; its scalar arguments
-and the resulting global state are still compared. Kernel-local `exit` calls are
-captured without intercepting libFuzzer itself: matching termination and exit
-status pass, while return-vs-exit or different exit statuses fail.
+Templates are `prompts/llvm_ir_vectorize_fast_v1.txt` and
+`prompts/llvm_ir_self_correction_fast_v1.txt`. Temperature is omitted by default.
+Each attempt saves prompts, candidates, postprocessing reports, and validator
+logs. `records.jsonl` and `summary.json` collect results.
 
-When Alive2 and merged-IR fuzzing are enabled, the TSVC compile/run/checksum must
-pass first. Either semantic validator passing then accepts the candidate and stops
-self-correction unless the other validator found a concrete counterexample.
-Unsupported Alive2 features and harness/toolchain
-failures, including libFuzzer timeouts without a differential mismatch, are
-marked inconclusive rather than blamed on the candidate; if all
-semantic validators are inconclusive and the TSVC run passes, the runner stops
-without spending another repair attempt. The TSVC checksum remains an independent
-diagnostic and performance-harness result. If neither semantic validator is
-enabled, the TSVC checksum remains the acceptance condition.
-The fuzz pipeline verifies the prefixed reference and candidate modules
-separately before linking them. Invalid candidate IR and sanitizer failures whose
-stack is inside the candidate kernel are concrete failures; crashes in the
-reference kernel remain inconclusive because generated inputs may violate a
-kernel-specific precondition.
+With both semantic validators enabled, acceptance requires compilation and the
+TSVC check, plus a pass from Alive2 or differential fuzzing. A concrete
+counterexample from either validator prevents acceptance. Unsupported features
+and tool errors are inconclusive. Without semantic-validation flags, the runner
+can accept TSVC-only results; enable both for the paper's correctness protocol.
 
-To reuse attempt-zero generations from an earlier result directory while
-writing a separate self-correction condition, add:
+Differential fuzzing links renamed reference and candidate implementations into
+one LLVM module, initializes identical state, and compares observable outputs.
+During fuzzing only, implementations stop after three `dummy()` calls. Matching
+kernel-local `exit()` behavior is checked too. The timing path uses the full TSVC
+iteration setting. Finite fuzzing does not prove equivalence for all inputs.
+
+For self-correction, use the command above with `--max-iters 5` and
+`--out-dir runs/tsvc_ir_opt/gpt5_top20_self_correct`. This allows one initial
+generation and up to four repairs using original IR, the previous candidate, and
+structured validation feedback. Accepted candidates stop repair. Inconclusive
+validation alone does not trigger additional repair spending.
+
+To reuse saved Pass@1 generations in that separate experiment, add:
 
 ```bash
-  --seed-results-dir runs/tsvc_ir_opt/gpt5_top20 \
-  --skip-existing \
-  --resume-completed
+--seed-results-dir runs/tsvc_ir_opt/gpt5_top20_pass1
 ```
-Every seeded baseline and guided candidate is copied into attempt zero and rerun
-through TSVC, Alive2, and merged-IR fuzzing. A failed TSVC check or concrete
-Alive2/fuzz counterexample is included in the repair prompt for the next attempt.
-`summary.json` reports the seeded and passing counts under
-`attempt_zero_validation`; pass `--limit 0` to process the complete manifest.
-On a later invocation using the same output directory, `--resume-completed`
-reuses successful mode records without rerunning their reference build or any
-validator. Failed modes continue independently, while `--skip-existing` reuses
-every successful LLM generation from their existing attempt directories. The
-runner keeps `records.resume_snapshot.jsonl` so an interrupted resume retains the
-last complete set of success records.
-Generated candidate IR is post-processed before verification to repair common
-LLM syntax issues such as redundant vector operand types, opaque-pointer
-bitcasts, and SSA-assigned constants. Each mode writes `postprocess.json` with
-the applied transforms; pass `--no-ir-postprocess` for ablations.
-For post-generation verification runs that should avoid the slow scalar IR
-performance baseline, pass `--skip-scalar-ir-eval`; candidate correctness and
-runtime are still measured, but `speedup_vs_scalar_ir` is left unset.
-The runner records target details in `target.json`. It first asks
-`clang -march=native -###` for the LLVM target CPU, then falls back to
-`gcc -Q --help=target -march=native` and CPU-model heuristics when clang reports
-only `native`; pass `--target-cpu znver4` or a similar LLVM CPU name to override
-auto-detection.
-The scalar IR shown to the LLM and the generated candidate IR used for
-verification are patched with the detected `"target-cpu"` and
-`"target-features"` function attributes by default, matching the native compile
-path. Pass `--no-target-attributes` only for ablations.
 
-To measure ordinary compiler baselines on the same TSVC harness, run the
-compiler-only baseline runner. It builds each kernel with GCC first, uses GCC as
-the checksum/time reference, then reports LLVM and ICX speedups as
-`gcc_time / compiler_time`:
+Keep `--skip-existing --resume-completed` on resumptions. Completed successful
+mode records are reused and successful saved LLM calls are not repeated.
+Seeding a new output directory can rerun validation of the reused IR; subsequent
+repair attempts can still make new API calls.
+
+## 4. Measure performance
 
 ```bash
+python3 scripts/benchmark_tsvc_correct_candidates.py \
+  --experiment-dir runs/tsvc_ir_opt/gpt5_top20_self_correct \
+  --tsvc-root runs/tsvc_kernels/v1 \
+  --output-dir runs/tsvc_performance/gpt5_top20_self_correct \
+  --gcc gcc --clang "$LLVM_BUILD_DIR/bin/clang" \
+  --warmups 0 --repetitions 1 --run-timeout 300
+
 python3 scripts/run_tsvc_compiler_baselines.py \
   --manifest runs/manifests/tsvc_kernels.jsonl \
   --tsvc-root runs/tsvc_kernels/v1 \
   --out-dir runs/tsvc_compiler_baselines/native_o3 \
-  --compiler gcc=gcc \
-  --compiler llvm19=/path/to/llvm-19.1.0/bin/clang \
-  --compiler icx=icx \
-  --reference gcc \
-  --march native \
-  --opt-level 3 \
-  --limit 151 \
-  --run-timeout 300 \
-  --jobs 20
+  --compiler gcc=gcc --compiler llvm19="$LLVM_BUILD_DIR/bin/clang" \
+  --compiler icx=icx --reference gcc --march native --opt-level 3 \
+  --limit 151 --run-timeout 300 --jobs 1
 ```
 
-The output directory contains per-kernel compile/run logs plus
-`records.jsonl` and `summary.json`; the summary includes arithmetic and
-geometric means for `llvm19_vs_gcc` and `icx_vs_gcc`.
-The same LLM client is available directly as `python3 scripts/ask_llm.py`, which
-reads from stdin, `-p`, or `--file` and uses the same config format. Keep API
-keys out of git; set `OPENAI_API_KEY` or pass a private config file.
+Use the actual experiment directory, including the Pass@1 directory when timing
+that condition. Omit ICX if unavailable. Baseline and guided candidates are
+selected independently: the timing script requires TSVC and at least one
+semantic validator to pass. `--repetitions` controls complete executable
+invocations, not the internal TSVC iteration parameter. Avoid concurrent timing
+workloads.
 
-For a single source file or LLVM IR file, use the one-program wrapper. It emits
-or copies pre-vectorization IR, runs region-intrinsic recommendation, writes a
-one-row `suite=single` manifest, and then calls the same baseline/guided IR
-generation runner. Since an arbitrary program has no TSVC checksum harness, the
-wrapper defaults to generation-only:
+Use one consistent GCC reference for every per-kernel speedup:
+`GCC -O3 time / candidate time`. The paper reports a geometric mean over all 151
+kernels, assigning `0.1x` to unsuccessful LLM outputs. Accepted-only timing
+averages are a different quantity. Counts at `>=1.0x`, `>=1.2x`, `>=1.5x`, and
+`>=2.0x` are cumulative.
 
-```bash
-python3 scripts/run_single_program_ir_optimization_pipeline.py \
-  --program examples/gemm/gemm_scalar.c \
-  --checkpoint /home/amax/ql/SRC/ComAgent/runs/llvm_vectorize_regions/models/x86_v1/amx_probe_candidates/epoch_0080_rank_03_hits_002.pt \
-  --instruction-graph-dir /home/amax/ql/SRC/ComAgent/runs/llvm_vectorize_regions/x86_v1/instruction_graphs_with_amx \
-  --llvm-project-root /path/to/llvm-project \
-  --out-dir runs/single_ir_opt/gemm_scalar \
-  --api-base-url "$OPENAI_BASE_URL" \
-  --api-key "$OPENAI_API_KEY" \
-  --model gpt-5 \
-  --max-tokens 16000 \
-  --modes baseline,guided \
-  --clang clang \
-  --cc cc \
-  --skip-existing \
-  --jobs 2
-```
+## 5. Retrieval ablations
 
-Outputs are grouped under the wrapper output directory:
-
-```text
-prevec_ir/<program>.ll
-recommendations/top20/recommendations.jsonl
-intrinsic_declarations/intrinsic_declarations.json
-ir_opt/gpt5_top20/{records.jsonl,summary.json,...}
-```
-
-`--llvm-project-root` is optional. When present, declarations are resolved from
-this program's recommendation file after inference. If omitted, the guided
-prompt still includes recommendation names, but not exact LLVM declarations.
-Use `--intrinsic-declarations-json` only when intentionally reusing a
-pre-resolved declarations file.
-
-For a quick AMX smoke test, emit scalar GEMM IR and run the no-AMX checkpoint
-against the inference-time instruction graph directory that contains AMX:
-
-```bash
-mkdir -p runs/gemm_prevec_ir runs/gemm_recommendations
-
-clang -S -emit-llvm -O2 -fno-vectorize -fno-slp-vectorize -fno-unroll-loops \
-  examples/gemm/gemm_scalar.c \
-  -o runs/gemm_prevec_ir/gemm_scalar.ll
-
-python3 scripts/recommend_region_intrinsics.py \
-  --ir-file runs/gemm_prevec_ir/gemm_scalar.ll \
-  --checkpoint runs/llvm_vectorize_regions/models/region_intrinsic_x86_v1/best.pt \
-  --instruction-graph-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs_with_amx \
-  --out-jsonl runs/gemm_recommendations/gemm_amx.jsonl \
-  --out-md runs/gemm_recommendations/gemm_amx.md \
-  --top-k 20 \
-  --store-slice-depth 8 \
-  --store-slice-max-nodes 256 \
-  --device cuda
-
-grep -Ein "amx|tdpb|tile" runs/gemm_recommendations/gemm_amx.md
-```
-
-The recommender re-encodes instruction graph rows with the checkpoint's existing
-instruction vocabulary. That lets the inference directory contain AMX even
-though the checkpoint was trained without AMX; tokens never seen during training
-fall back to `<unk>`.
-
-To train continuously while checking the GEMM AMX zero-shot probe every few
-epochs, use the training graph directory without AMX and the probe graph
-directory with AMX:
-
-```bash
-REGION_DIR=runs/llvm_vectorize_regions/x86_store_phi_nomem_v3
-MODEL_DIR=runs/llvm_vectorize_regions/models/region_intrinsic_x86_store_phi_nomem_v3_amx_probe
-
-mkdir -p runs/gemm_prevec_ir
-clang -S -emit-llvm -O2 -fno-vectorize -fno-slp-vectorize -fno-unroll-loops \
-  examples/gemm/gemm_scalar.c \
-  -o runs/gemm_prevec_ir/gemm_scalar.ll
-
-python3 scripts/train_region_intrinsic_model.py \
-  --region-dir "$REGION_DIR" \
-  --instruction-graph-dir "$REGION_DIR/instruction_graphs" \
-  --out-dir "$MODEL_DIR" \
-  --epochs 60 \
-  --batch-size 32 \
-  --instruction-batch-size 128 \
-  --hidden-dim 128 \
-  --layers 3 \
-  --dropout 0.15 \
-  --lr 0.001 \
-  --weight-decay 0.0001 \
-  --temperature 0.07 \
-  --match-loss-weight 1.0 \
-  --max-pos-weight 20.0 \
-  --device cuda \
-  --probe-every-epochs 5 \
-  --probe-ir-file runs/gemm_prevec_ir/gemm_scalar.ll \
-  --probe-instruction-graph-dir "$REGION_DIR/instruction_graphs_with_amx" \
-  --probe-out-dir "$MODEL_DIR/amx_probe" \
-  --probe-top-k 20 \
-  --probe-store-slice-depth 8 \
-  --probe-store-slice-max-nodes 256
-```
-
-The trainer writes normal training checkpoints, a probe report for every probe
-epoch, and one candidate checkpoint for every probe epoch whose top-k
-recommendations include an AMX/tdpb/tile target:
-
-```text
-$MODEL_DIR/best.pt
-$MODEL_DIR/last.pt
-$MODEL_DIR/amx_probe_candidates/epoch_*.pt
-$MODEL_DIR/amx_probe_candidates/epoch_*.json
-$MODEL_DIR/amx_probe/probe_history.jsonl
-```
-
-The output is inference-only: each candidate region gets a change probability
-and a ranked list of intrinsic/vector labels. It does not require after-IR or
-diff labels. Generic vector load/store labels are hidden from the ranking by
-default; pass `--include-memory-labels` only when inspecting raw closed-set
-behavior.
-
-On Ubuntu, run these commands from the repository root. The scripts are portable
-Python and do not require Windows paths or PowerShell, but the server must have:
-
-```bash
-python3 --version
-python3 -m pip install torch
-/path/to/llvm-project/build/bin/opt --version
-```
-
-The LLVM `opt` binary should come from the same LLVM checkout as the test
-directories when possible. If the first collection run fails, inspect
-`runs/llvm_vectorize_regions/x86_v1/summary.json`; failed tests are recorded
-there with the `opt` stderr.
-
-The instruction side uses the same `mini-programl` idea. Each instruction or
-intrinsic gets metadata plus a Vegen-style Operation graph. The Operation text
-is parsed into statements and expressions such as `For`, `Update`,
-`BitSlice`, `BinaryExpr`, `Var`, and `Number`; those AST nodes are then lowered
-to mini-ProGraML. Symbols in the pseudocode, including temporaries and loop
-indices, become variable nodes; arithmetic/effectful expressions and bit slices
-become instruction nodes; static loops get a control self-loop with
-execution-count features.
-
-```json
-{
-  "label": "llvm.x86.sse2.padd.w",
-  "architecture": "x86",
-  "extension": "SSE2",
-  "intrinsic": "_mm_add_epi16",
-  "instruction": "paddw xmm, xmm",
-  "cpuid": ["SSE2"],
-  "operation": [
-    "FOR j := 0 to 7",
-    "i := j*16",
-    "dst[i+15:i] := a[i+15:i] + b[i+15:i]",
-    "ENDFOR"
-  ]
-}
-```
-
-This produces variable nodes such as `j`, `i`, `dst`, `a`, and `b`. The loop
-node has a `control` self-loop; for `0 to 7`, the loop body has
-`iteration_count=8` and the self-loop/backedge has `execution_count=7`.
-
-Readable intrinsic sketch:
-
-```text
-nodes
-  instruction  for
-  variable     j
-  instruction  mul
-  variable     i
-  instruction  add
-  instruction  slice       a[i+15:i]
-  instruction  slice       b[i+15:i]
-  instruction  slice       dst[i+15:i]
-  variable     dst
-  variable     a
-  variable     b
-
-edges
-  for -> for        control(backedge=true, iteration_count=8, execution_count=7)
-  for -> j          data(role=induction_def)
-  j -> mul          data(role=use, execution_count=8)
-  16 -> mul         data(role=constant, execution_count=8)
-  mul -> i          data(role=def, execution_count=8)
-  a -> slice        data(role=base, execution_count=8)
-  i + 15 -> slice   data(role=hi, execution_count=8)
-  i -> slice        data(role=lo, execution_count=8)
-  slice(a) -> add   data(role=lhs, execution_count=8)
-  slice(b) -> add   data(role=rhs, execution_count=8)
-  dst -> slice      data(role=base, execution_count=8)
-  add -> slice(dst) data(role=def, execution_count=8)
-```
-
-Build those instruction Operation graphs with:
-
-```bash
-python3 scripts/build_instruction_semantic_graphs.py \
-  --spec-jsonl examples/instruction_semantics/instruction_specs.jsonl \
-  --split-policy config/instruction_semantic_splits.json \
-  --out-dir runs/instruction_semantics/sample
-```
-
-For one-off inspection or inference-time construction of an intrinsic graph,
-use the same standalone parser with intrinsic mode:
-
-```bash
-python3 scripts/build_mini_programl_graph.py \
-  --mode intrinsic \
-  --spec-jsonl examples/instruction_semantics/instruction_specs.jsonl \
-  --out runs/inference/intrinsic_graphs.jsonl
-```
-
-To convert Intel/Vegen Intrinsics Guide XML into the spec JSONL format:
-
-```bash
-python3 scripts/import_intel_intrinsics_xml.py \
-  --xml /path/to/data-latest.xml \
-  --llvm-alias-map runs/instruction_semantics/x86_llvm_aliases.json \
-  --out runs/instruction_semantics/intel_intrinsics.jsonl
-```
-
-Build that alias map with Vegen-style wrappers:
-
-```bash
-python3 scripts/build_x86_intrinsic_alias_map.py \
-  --xml /path/to/data-latest.xml \
-  --emit-wrapper-c runs/instruction_semantics/x86_wrappers.c \
-  --compile-ir runs/instruction_semantics/x86_wrappers.ll \
-  --out runs/instruction_semantics/x86_llvm_aliases.json
-```
-
-Wrapper compilation is best-effort by default: incompatible intrinsics are
-isolated and recorded in `x86_llvm_aliases.skipped.json` while all compilable
-wrappers still contribute aliases. Pass `--strict` for all-or-nothing behavior.
-
-Build dependency-free text-retrieval recommendations for TSVC from only the
-compiled alias map and Intel XML descriptions:
+Prepare an external Intel Intrinsics Guide XML, an Intel-to-LLVM alias map, and
+per-kernel IR summaries. `scripts/build_x86_intrinsic_alias_map.py --help`
+describes wrapper generation and alias extraction.
 
 ```bash
 python3 scripts/build_tsvc_text_retrieval_recommendations.py \
   --xml /path/to/data-latest.xml \
   --alias-map runs/ablation/intel_to_llvm_aliases.json \
-  --summaries /path/to/IR_summaries.zip \
-  --method bm25 \
-  --top-k 20 \
+  --summaries runs/ablation/IR_summaries.zip \
+  --method bm25 --top-k 20 \
   --out-jsonl runs/ablation/bm25/recommendations.jsonl
 ```
 
-The output JSONL is accepted by `run_tsvc_ir_optimization_experiment.py` via
-`--recommendations-jsonl`. Use `--method random --seed N` for reproducible
-random hints, or `--method full` for the complete mapped Intel list. These
-retriever ablations should use `--max-iters 1`; for the full-list condition,
-also set `--recommendation-top-k` to the corpus size reported by the builder.
+Use `--method random --seed 0` or `--method full` with separate output paths for
+the other strategies. The builder makes no LLM calls. BM25 summaries must
+already exist; random and full-list modes use that input to enumerate kernels.
+Vendor descriptions support textual ranking; generation receives names and
+signatures.
 
-For the dual-graph retriever, train with a program graph directory and an
-instruction graph directory:
+Evaluate each recommendation set through the IR runner with
+`--modes guided --max-iters 1`. For the full list, set
+`--recommendation-top-k` to the corpus size to avoid the default top-20 cap.
+The wrapper `scripts/run_tsvc_retriever_ablation_pass1.sh` automates BM25, three
+random seeds, and full-list generation. Set the environment variables at the top
+of that script for your recommendation files, LLVM installation, Alive2, and
+private LLM configuration. Full-list prompts can be substantially larger.
 
-```bash
-python3 scripts/train_instruction_dual_gnn.py \
-  --program-graph-dir runs/iroptset/graphs/pilot_10k_v1 \
-  --instruction-graph-dir runs/iroptset/instruction_graphs/pilot_10k_v1 \
-  --out-dir runs/iroptset/models/dual_gnn_pilot_10k_v1
-```
-
-When using `scripts/run_iroptset_gnn_pipeline.sh`, set
-`INSTRUCTION_SPEC_JSONL=...`. The pipeline always trains the dual-graph
-retriever. It filters train labels through `train.instruction_graphs.jsonl` and
-uses `MAX_TRAIN_EXAMPLES_PER_INSTRUCTION` to cap very common labels.
-
-
-## GPT-5.5 Pass@1
-
-The fixed prompt template for fast assembly generation is:
-
-```text
-prompts/source_to_asm_fast_v1.txt
-```
-
-Run one GPT-5.5 candidate per task with:
+## Single-program example
 
 ```bash
-OPENAI_API_KEY=... python3 scripts/run_pass_at_1.py \
-  --manifest runs/manifests/tsvc.jsonl \
-  --out-dir runs/pass_at_1/gpt-5.5/tsvc_v1 \
-  --model gpt-5.5 \
-  --target x86_64-pc-linux-gnu \
-  --mode source-to-asm \
-  --limit 10
+python3 scripts/run_single_program_ir_optimization_pipeline.py \
+  --program examples/gemm/gemm_scalar.c \
+  --checkpoint runs/llvm_vectorize_regions/models/x86_v1/last.pt \
+  --instruction-graph-dir runs/llvm_vectorize_regions/x86_v1/instruction_graphs_with_amx \
+  --llvm-project-root "$LLVM_PROJECT_ROOT" \
+  --llvm-config "$LLVM_BUILD_DIR/bin/llvm-config" \
+  --clang "$LLVM_BUILD_DIR/bin/clang" \
+  --out-dir runs/single_ir_opt/gemm --model gpt-5 --max-tokens 16000
 ```
 
-The first automatic score is `pass_at_1_assemble`. Link-and-run correctness
-should be added per TSVC/NPB harness before claiming semantic correctness.
-
-## Agentic Compiler Condition
-
-For the paper claim "an agent replaces the compiler", use a fixed generation
-template, fixed verifier, fixed repair template, and fixed iteration budget:
-
-```bash
-python3 scripts/run_agentic_compile.py \
-  --manifest runs/manifests/tsvc.jsonl \
-  --out-dir runs/agentic/gpt-5.5/tsvc_v1 \
-  --agent-cmd "your-agent-command" \
-  --target x86_64-pc-linux-gnu \
-  --mode source-to-asm \
-  --limit 10 \
-  --max-iters 5
-```
-
-This reports within-budget agentic success. Keep it separate from pass@1.
-
-## Minimal Agent Loop
-
-Create a prompt for one benchmark task and ask an external agent command to emit
-assembly:
-
-```bash
-python3 scripts/llm_compile.py \
-  --manifest runs/manifests/tsvc.jsonl \
-  --index 0 \
-  --target x86_64-pc-linux-gnu \
-  --mode source-to-asm \
-  --agent-cmd "python3 examples/mock_agent.py" \
-  --out runs/candidates/task0.s
-```
-
-The mock agent intentionally returns invalid placeholder assembly. Replace
-`--agent-cmd` with the real LLM compiler agent. The command receives the prompt
-on stdin and must write assembly to stdout.
-
-Then check whether the generated assembly can at least assemble:
-
-```bash
-python3 scripts/evaluate_asm.py \
-  --asm runs/candidates/task0.s \
-  --target x86_64-pc-linux-gnu \
-  --workdir runs/eval/task0
-```
-
-For paper-grade evaluation, add a harness and run command so the object is linked
-and executed against benchmark-specific correctness checks.
-
-## Evaluation Metrics
-
-- assembly success rate
-- link success rate
-- benchmark verifier pass rate
-- differential correctness against compiler-built reference binaries
-- fuzz/property-test pass rate for isolated kernels
-- runtime versus `clang/gcc/gfortran -O0/-O2/-O3`
-- code size versus compiler baseline
-- pass@k after iterative feedback
-- agent cost: tokens, retries, wall time
-
-See [docs/research_plan.md](docs/research_plan.md) for the proposed paper path
-and [docs/benchmark_protocol.md](docs/benchmark_protocol.md) for the benchmark
-rules behind the compiler-replacement claim. The iterative-agent protocol is in
-[docs/agentic_compiler_protocol.md](docs/agentic_compiler_protocol.md).
+This wrapper defaults to generation only. An arbitrary program needs its own
+correctness and timing harness before the result can be considered an accepted
+optimization. AMX execution requires supporting hardware and operating-system
+support.
