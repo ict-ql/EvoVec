@@ -9,7 +9,7 @@ import sys
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from neural_asm_pipeline.llm_client import client_from_config, config_value  # noqa: E402
+from llm_client import client_from_config, config_value  # noqa: E402
 
 
 def main() -> int:

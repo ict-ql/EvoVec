@@ -13,7 +13,7 @@ import sys
 REPO_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(REPO_ROOT / "src"))
 
-from neural_asm_pipeline.tasks import detect_language
+from tasks import detect_language
 
 
 def run_checked(command: list[str], *, dry_run: bool = False) -> None:

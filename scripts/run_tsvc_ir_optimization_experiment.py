@@ -444,7 +444,7 @@ def validate_ir_candidate(
     alive2_result = run_alive2(args, source_ir_path, candidate_ir_path, out_dir / "alive2")
     differential_result = build_and_run_ir(args, task, candidate_ir_path, out_dir, expected_checksum)
     if args.differential_fuzz:
-        from neural_asm_pipeline.differential_fuzz import run_differential_fuzz
+        from differential_fuzz import run_differential_fuzz
 
         fuzz_result = run_differential_fuzz(
             source_ir_path=source_ir_path,
@@ -556,7 +556,7 @@ def repair_verifier_feedback(result: dict[str, Any]) -> dict[str, Any]:
 def patch_target_attributes_if_enabled(args: argparse.Namespace, ir_path: Path) -> dict[str, Any]:
     if args.no_target_attributes:
         return {"patched": False, "disabled": True, "path": str(ir_path)}
-    from neural_asm_pipeline.target_attributes import patch_ir_file
+    from target_attributes import patch_ir_file
 
     return patch_ir_file(ir_path, args.target_attributes)
 
@@ -564,7 +564,7 @@ def patch_target_attributes_if_enabled(args: argparse.Namespace, ir_path: Path) 
 def postprocess_ir_if_enabled(args: argparse.Namespace, ir_path: Path) -> dict[str, Any]:
     if args.no_ir_postprocess:
         return {"changed": False, "disabled": True, "path": str(ir_path)}
-    from neural_asm_pipeline.ir_postprocess import postprocess_ir_file
+    from ir_postprocess import postprocess_ir_file
 
     return postprocess_ir_file(ir_path)
 
@@ -1247,7 +1247,7 @@ def main() -> int:
         parser.error("--recommendation-top-k must be positive")
 
     if not args.prompt_only and not args.agent_cmd:
-        from neural_asm_pipeline.llm_client import client_from_config, config_value
+        from llm_client import client_from_config, config_value
 
         client, section = client_from_config(
             args.llm_config,
@@ -1261,7 +1261,7 @@ def main() -> int:
         args.model = args.model or "agent-cmd"
         args.api_mode = args.api_mode or "agent-cmd"
 
-    from neural_asm_pipeline.target_detect import detect_target
+    from target_detect import detect_target
 
     target_info = detect_target(
         compiler=args.clang,
@@ -1274,7 +1274,7 @@ def main() -> int:
     args.target_cpu_name = str(target_info["target_cpu_name"])
     target_attr_info: dict[str, Any] = {"attributes": {}, "disabled": args.no_target_attributes}
     if not args.no_target_attributes:
-        from neural_asm_pipeline.target_attributes import target_attribute_values
+        from target_attributes import target_attribute_values
 
         target_attr_info = target_attribute_values(
             clang=args.clang,

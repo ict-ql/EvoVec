@@ -67,14 +67,15 @@ validation, and timing do not call the LLM.
 | `scripts/build_tsvc_text_retrieval_recommendations.py` | BM25, random, and full-list hints |
 | `scripts/rebuild_tsvc_records.py` | Rebuild records from saved results |
 | `prompts/` | English IR generation and repair templates |
-| `src/neural_asm_pipeline/` | Shared LLM, IR, target, and fuzzing utilities |
+| `src/` | Shared LLM, IR, target, and fuzzing utilities |
 | `examples/` | LLVM IR, GEMM, and instruction-semantic examples |
 | `third_party/TSVC_2/src/` | TSVC sources used to construct harnesses |
 | `runs/` | Generated datasets, checkpoints, candidates, and logs; Git-ignored |
 
-The shared package retains its historical name `neural_asm_pipeline` for import
-compatibility. Shared graph encoders and intrinsic-label extraction utilities are
-in `scripts/graph_encoder.py` and `scripts/intrinsic_labels.py`, respectively.
+Shared utilities are stored directly in `src/`. Script entry points add this
+directory to the Python import path automatically. Shared graph encoders and
+intrinsic-label extraction utilities are in `scripts/graph_encoder.py` and
+`scripts/intrinsic_labels.py`, respectively.
 
 ## 1. Build data and train the retriever
 
